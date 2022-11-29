@@ -18,6 +18,7 @@ import (
 	"github.com/vmware-tanzu/nsx-operator/pkg/apis/v1alpha1"
 	"github.com/vmware-tanzu/nsx-operator/pkg/config"
 	securitypolicycontroller "github.com/vmware-tanzu/nsx-operator/pkg/controllers/securitypolicy"
+        vpcnetworkconfigcontroller "github.com/lxiaopei/nsx-operator/pkg/controllers/vpcnetworkconfig"
 	"github.com/vmware-tanzu/nsx-operator/pkg/logger"
 	"github.com/vmware-tanzu/nsx-operator/pkg/metrics"
 	"github.com/vmware-tanzu/nsx-operator/pkg/nsx"
@@ -68,6 +69,17 @@ func StartSecurityPolicyController(mgr ctrl.Manager, commonService common.Servic
 	}
 }
 
+func StartVPCNetworkConfigController(mgr ctrl.Manager) {
+        vpcNetworkReconcile := &vpcnetworkconfigcontroller.VPCNetworkConfigurationReconciler{
+                Client: mgr.GetClient(),
+                Scheme: mgr.GetScheme(),
+        }
+        if err := vpcNetworkReconcile.Start(mgr); err != nil {
+                log.Error(err, "failed to create controller", "controller", "VPCNetworkConfig")
+                os.Exit(1)
+        }
+}
+
 func main() {
 	log.Info("starting NSX Operator")
 
@@ -98,6 +110,7 @@ func main() {
 
 	// Start the security policy controller.
 	StartSecurityPolicyController(mgr, commonService)
+        StartVPCNetworkConfigController(mgr)
 
 	if metrics.AreMetricsExposed(cf) {
 		go updateHealthMetricsPeriodically(nsxClient)
