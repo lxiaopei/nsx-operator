@@ -2,6 +2,11 @@ module github.com/vmware-tanzu/nsx-operator
 
 go 1.21
 
+replace (
+	github.com/vmware-tanzu/nsx-operator/pkg/apis => ./pkg/apis
+	github.com/vmware-tanzu/nsx-operator/pkg/client => ./pkg/client
+)
+
 require (
 	github.com/agiledragon/gomonkey/v2 v2.9.0
 	github.com/apparentlymart/go-cidr v1.1.0
