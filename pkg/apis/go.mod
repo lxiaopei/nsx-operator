@@ -1,4 +1,4 @@
-module github.com/vmware-tanzu/nsx-operator/pkg/apis
+module github.com/lxiaopei/nsx-operator/pkg/apis
 
 go 1.21
 
