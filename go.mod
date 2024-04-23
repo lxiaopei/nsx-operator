@@ -1,4 +1,4 @@
-module github.com/vmware-tanzu/nsx-operator
+module github.com/lxiaopei/nsx-operator
 
 go 1.21
 
