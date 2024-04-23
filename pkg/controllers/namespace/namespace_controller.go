@@ -91,7 +91,7 @@ func (r *NamespaceReconciler) createVPCCR(ctx *context.Context, obj client.Objec
 	return vpcCR, nil
 }
 
-func (r *NamespaceReconciler) createDefaultSubnetSet(ns string) error {
+func (r *NamespaceReconciler) createDefaultSubnetSet(ns string, defaultPodAccessMode string) error {
 	defaultSubnetSets := map[string]string{
 		types.DefaultVMSubnetSet:  types.LabelDefaultVMSubnetSet,
 		types.DefaultPodSubnetSet: types.LabelDefaultPodSubnetSet,
@@ -126,6 +126,12 @@ func (r *NamespaceReconciler) createDefaultSubnetSet(ns string) error {
 						},
 					},
 				},
+			}
+			if name == types.DefaultVMSubnetSet {
+				// use "Private" type for VM
+				obj.Spec.AccessMode = v1alpha1.AccessMode("Private")
+			} else if name == types.DefaultPodSubnetSet {
+				obj.Spec.AccessMode = v1alpha1.AccessMode(defaultPodAccessMode)
 			}
 			if err := r.Client.Create(context.Background(), obj); err != nil {
 				return err
@@ -175,18 +181,18 @@ func (r *NamespaceReconciler) insertNamespaceNetworkconfigBinding(ns string, ann
 }
 
 /*
-	VPC creation strategy:
+		   VPC creation strategy:
 
-We suppose namespace should have following annotations:
-  - "nsx.vmware.com/vpc_name": "<Namespace Name>/<Supervisor ID>"
-    If the ns contains this annotation, first check if	the namespace in annotation is the same as
-    the one in ns event, if yes, create an infra VPC for it. if	not, skip the whole ns event as the infra
-    VPC will be created its corresponding ns creation event.
-  - "nsx.vmware.com/vpc_network_config":"<Supervisor ID>"
-    If ns do not contains "nsx.vmware.com/vpc_name" annotation. Use this annotation to handle VPC creation.
-    VPC will locate the network config with the CR name, and create VPC using its config.
-  - If the ns do not have either of the annotation above, then we believe it is using default VPC, try to search
-    default VPC in network config CR store. The default VPC network config CR's name is "default".
+	   We suppose namespace should have following annotations:
+		 - "nsx.vmware.com/vpc_name": "<Namespace Name>/<Supervisor ID>"
+		   If the ns contains this annotation, first check if	the namespace in annotation is the same as
+		   the one in ns event, if yes, create an infra VPC for it. if	not, skip the whole ns event as the infra
+		   VPC will be created its corresponding ns creation event.
+		 - "nsx.vmware.com/vpc_network_config":"<Supervisor ID>"
+		   If ns do not contains "nsx.vmware.com/vpc_name" annotation. Use this annotation to handle VPC creation.
+		   VPC will locate the network config with the CR name, and create VPC using its config.
+		 - If the ns do not have either of the annotation above, then we believe it is using default VPC, try to search
+		   default VPC in network config CR store. The default VPC network config CR's name is "default".
 */
 func (r *NamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	obj := &v1.Namespace{}
@@ -250,7 +256,13 @@ func (r *NamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if _, err := r.createVPCCR(&ctx, obj, ns, ncName, createVpcName); err != nil {
 			return common.ResultRequeueAfter10sec, nil
 		}
-		if err := r.createDefaultSubnetSet(ns); err != nil {
+		nc, ncExist := r.VPCService.GetVPCNetworkConfig(ncName)
+		if !ncExist {
+			message := fmt.Sprintf("missing network config %s for namespace %s", ncName, ns)
+			r.namespaceError(&ctx, obj, message, nil)
+			return common.ResultRequeueAfter10sec, nil
+		}
+		if err := r.createDefaultSubnetSet(ns, nc.DefaultPodSubnetAccessMode); err != nil {
 			return common.ResultRequeueAfter10sec, nil
 		}
 		return common.ResultNormal, nil
