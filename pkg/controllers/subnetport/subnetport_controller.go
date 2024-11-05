@@ -5,7 +5,6 @@ package subnetport
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -78,12 +77,6 @@ func (r *SubnetPortReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		log.Error(err, "unable to fetch SubnetPort CR", "SubnetPort", req.NamespacedName)
 		return common.ResultRequeue, err
-	}
-	if len(subnetPort.Spec.SubnetSet) > 0 && len(subnetPort.Spec.Subnet) > 0 {
-		err := errors.New("subnet and subnetset should not be configured at the same time")
-		log.Error(err, "failed to get subnet/subnetset of the subnetport", "subnetport", req.NamespacedName)
-		updateFail(r, ctx, subnetPort, &err)
-		return common.ResultNormal, err
 	}
 
 	if subnetPort.ObjectMeta.DeletionTimestamp.IsZero() {

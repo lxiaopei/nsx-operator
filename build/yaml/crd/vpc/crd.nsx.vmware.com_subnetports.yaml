@@ -59,6 +59,10 @@ spec:
                 description: SubnetSet defines the parent SubnetSet name of the SubnetPort.
                 type: string
             type: object
+            x-kubernetes-validations:
+            - message: Only one of subnet or subnetSet can be specified
+              rule: has(self.subnet) && !has(self.subnetSet) || !has(self.subnet)
+                && has(self.subnetSet)
           status:
             description: SubnetPortStatus defines the observed state of SubnetPort.
             properties:

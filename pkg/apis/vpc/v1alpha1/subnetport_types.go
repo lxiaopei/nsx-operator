@@ -7,6 +7,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// +kubebuilder:validation:XValidation:rule="has(self.subnet) && !has(self.subnetSet) || !has(self.subnet) && has(self.subnetSet)",message="Only one of subnet or subnetSet can be specified"
 // SubnetPortSpec defines the desired state of SubnetPort.
 type SubnetPortSpec struct {
 	// Subnet defines the parent Subnet name of the SubnetPort.
