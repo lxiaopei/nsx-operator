@@ -8,6 +8,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+type SharedSubnet struct {
+	Path string `json:"path"`
+}
+
 // VPCNetworkConfigurationSpec defines the desired state of VPCNetworkConfiguration.
 // There is a default VPCNetworkConfiguration that applies to Namespaces
 // do not have a VPCNetworkConfiguration assigned. When a field is not set
@@ -21,7 +25,7 @@ type VPCNetworkConfigurationSpec struct {
 
 	// NSX path of the shared Subnets the Namespace is associated with.
 	// +optional
-	Subnets []string `json:"subnets,omitempty"`
+	Subnets []SharedSubnet `json:"subnets,omitempty"`
 
 	// NSX Project the Namespace is associated with.
 	NSXProject string `json:"nsxProject,omitempty"`

@@ -70,7 +70,12 @@ spec:
                 description: NSX path of the shared Subnets the Namespace is associated
                   with.
                 items:
-                  type: string
+                  properties:
+                    path:
+                      type: string
+                  required:
+                  - path
+                  type: object
                 type: array
               vpc:
                 description: |-
