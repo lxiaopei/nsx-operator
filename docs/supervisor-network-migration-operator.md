@@ -4,36 +4,39 @@ The Supervisor migration framework runs as a separate process/container in the
 NCP Pod. It owns the cluster-scoped `migration.network.vmware.com/v1alpha1` resources
 `ControlPlaneNetworkTransition` and `NamespaceNetworkTransition`.
 
+## Branch scope
+
+This branch, `topic/xl018891/UBMWM-12405`, builds on
+`topic/xl018891/supervisor-network-migration-operator`. It adds action dispatch,
+persisted execution checkpoints, namespace readiness and infrastructure finalization dependency gates,
+and irreversible commit/finalize guards for
+[UBMWM-12405](https://vmw-jira.broadcom.net/browse/UBMWM-12405).
+The base branch retains the manager, observational watches, lazy NSX connectivity,
+CRD definitions, and packaging. Concrete external migration handlers are still pending.
+
 ## Framework and services
 
 - `cmd_migration`: independent controller manager; no normal NSX controllers,
   webhook servers, `electMaster` calls, or `nsx-operator-role` label changes.
 - `pkg/apis/migration/v1alpha1`: Shared orchestration APIs in migration.network.vmware.com/v1alpha1.
-- `pkg/migration/controllers`: controller registration and observation of both
-  transition kinds. Reconciliation leaves spec, status, and external resources unchanged.
-- `pkg/migration.SetupWithManager`: registers both `TransitionReconciler` instances
-  when migration is enabled; no intermediate `Operator` owner is constructed.
+- `pkg/migration/controllers` and `pkg/migration/transition`: live dependency gates,
+  action checkpoints, namespace rollback, infrastructure forward retry, and
+  irreversible commit/finalize recovery.
+- `pkg/migration.SetupWithManager`: registers both stages with a shared dispatcher
+  when enabled; no intermediate Operator or unused NSX service is constructed.
 - `pkg/nsx/services/migration.Service`: lazy NSX connectivity available for future
-  handlers, reusing `pkg/config` and `nsx.GetClient`. The framework does not
-  construct or inject an unused service. Sessions and connection pools are
-  process-local, not shared between containers.
+  handlers. Connections are process-local, not shared between containers.
 
-Migration observation defaults to disabled: no transition controllers, watches,
-or leader election are started. Disabled startup loads local Kubernetes REST
-configuration without probing API-server health, so an API `/healthz` failure
-does not prevent the process health/readiness endpoints from starting. Valid
-local REST configuration is still required. Enabled startup retains the existing
-API health check and loopback fallback. `--enable-network-migration` enables
-controller observation and the independent lease. This startup flag does not implement the vCenter FSS/HTTP
-authorization gate; a disabled reconciler does not return HTTP 403.
-The framework does not dispatch actions, update
-status, checkpoint execution, or enforce cross-resource dependencies. Those
-behaviors and their tests are isolated on `topic/xl018891/UBMWM-12405` for
-[UBMWM-12405](https://vmw-jira.broadcom.net/browse/UBMWM-12405).
-Startup does not load NSX configuration or contact NSX. Missing configuration or
-failed client initialization can be retried by future handlers. Migration startup
-must not depend solely on `HasVPCNamespaces()`, because a VDS Supervisor may not
-have any VPC namespaces before migration preparation.
+Migration dispatch defaults to disabled: no transition controllers, watches, or
+leader election are started. Disabled startup loads local Kubernetes REST
+configuration without probing API-server health. Valid local REST configuration
+is still required. Enabled startup retains the API health check and loopback
+fallback. `--enable-network-migration` enables dispatch and the independent lease;
+valid actions report `ActionNotImplemented` because external handlers are not yet
+wired. This flag does not implement the vCenter FSS/HTTP authorization gate.
+Startup does not load NSX configuration or contact NSX. Future handlers can retry
+missing configuration or failed client initialization. Migration startup must not
+rely solely on `HasVPCNamespaces()`, since a VDS Supervisor may have none.
 
 Both CRDs accept `Evaluate`, `Plan`, `Derive`, and `Execute`. Namespace batches
 additionally support `Rollback` and `Commit`; infrastructure supports `Finalize`.
@@ -42,11 +45,13 @@ actions retain checkpoints for diagnosis and forward retry. Infrastructure
 reversion uses the user-operated WCP backup-and-restore procedure outside the
 migration API; arrange a usable backup and recovery procedure before migration.
 Namespace rollback remains subject to dependency checks and the Commit boundary.
-Status fields define the contract for future execution and recovery, including
-`lastAction`, `actionState`, `actionGeneration`, and `irreversibleAction`. CRD
-validation remains part of the API definitions; no execution checkpoints are
-written by this branch. Namespace status defines `name`, `phase`, `reason`, and
-`message`; milestones are batch conditions, and counters follow spec membership.
+`lastAction`, `actionState`, and `actionGeneration` record accepted work. A handler
+returns `CheckpointIrreversible` only after prerequisite checks, then waits for
+persisted `status.irreversibleAction` before irreversible external changes. That
+checkpoint is immutable and closes namespace rollback at Commit.
+Infrastructure Rollback is rejected independently of any irreversible checkpoint. Exact workflow IDs remain durable.
+Namespace status contains `name`, `phase`, `reason`, and `message`; milestones are batch
+conditions, and counters are derived using batch membership from spec.
 
 ## Design contract
 
@@ -68,7 +73,7 @@ In 9.2, supported migrations use HAProxy or FLB (`VSPHERE_FOUNDATION`) sources
 and an NSX LB (`NSX_LB`) target. The API rejects unsupported provider values
 and exposes no Avi configuration. Evaluate handlers must report unsupported
 discovered sources through failure conditions before target preparation. The
-observational framework does not yet perform provider evaluation. HAProxy requires `networkConfiguration.legacyLbFrontendDvpgs`; FLB
+dispatcher does not yet implement provider evaluation handlers. HAProxy requires `networkConfiguration.legacyLbFrontendDvpgs`; FLB
 discovers frontend networks and VIP ranges. Unresolved FLB configuration is a
 discovery failure, not a prompt to guess network values.
 
@@ -100,10 +105,9 @@ bounds, unknown VDNs and conflicts between batches, belong to the concrete
 handlers, which have not shipped.
 
 `status.nsxWorkflows` is a map list keyed by `vdnName`, retaining the exact
-`workflowId` for recovery. The execution contract specifies `InfraTransitionComplete`
-and the matching condition for infrastructure, and `Completed` for namespace
-execution. It specifies `Finalized` for infrastructure finalization and `Committed`
-for namespace commit. Execution is implemented separately under UBMWM-12405.
+`workflowId` for recovery. Infrastructure execution reports `InfraTransitionComplete`
+and the matching condition; namespace execution reports `Completed`. Infrastructure
+finalization reports `Finalized`; namespace commit reports `Committed`.
 The checked-in `design-*.yaml` test fixtures retain all five current design output
 examples. Apply the samples under `build/yaml/samples/migration` to begin with
 `Evaluate`, then request each subsequent action after its prerequisites succeed.
@@ -203,10 +207,8 @@ packaging change, not by this repository alone.
 
 Concrete handlers still need a durable fenced mutation lock, finalizers and
 admission protection, current NSX ownership/consumer checks, reviewed plan and
-resource provenance records, and approval/onboarding checks. UBMWM-12405 owns action dispatch, persisted execution checkpoints, dependency
-gates, and commit/finalize guards. Its follow-on branch must adopt the new
-namespace-only Rollback contract before integration. Concrete handlers must recheck dependencies
-under the durable lock.
+resource provenance records, and approval/onboarding checks. Recheck dependencies
+under that lock; the dispatcher's process mutex only serializes its controllers.
 Never duplicate normal NSX controllers or delete active VPC/LB/SNAT resources.
 `NetworkResourceTransition` support is a prerequisite for real cutover handlers;
 it is not implemented by this scaffold. Container co-location does not replace
