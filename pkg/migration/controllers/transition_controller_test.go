@@ -124,6 +124,9 @@ func TestCompletedNamespaceBatchPreserved(t *testing.T) {
 				Status: &api.NamespaceNetworkTransitionStatus{TransitionStatus: api.TransitionStatus{
 					Phase: tc.phase, LastAction: tc.action, ActionState: api.ActionStateSucceeded, ActionGeneration: 4, Conditions: []metav1.Condition{condition}},
 					NamespaceStatuses: []api.NamespaceStatus{{Name: "tenant", Phase: tc.phase}}}}
+			if tc.action == api.ActionCommit {
+				batch.Status.IrreversibleAction = string(api.ActionCommit)
+			}
 			c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(batch).WithObjects(infra, batch).Build()
 			key := types.NamespacedName{Name: "batch"}
 			require.NoError(t, c.Get(context.Background(), key, batch))

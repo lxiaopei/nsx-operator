@@ -6,6 +6,7 @@ package transition
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -66,6 +67,7 @@ type Result struct {
 // install lifecycle admission guards, and ensure finalizer cleanup before acting.
 // Commit and Finalize must return CheckpointIrreversible after preflight checks,
 // then wait for the persisted irreversibleAction before irreversible changes.
+// irreversibleAction is engine-owned; handlers must not assign or clear it.
 // Commit handlers must verify approval/onboarding and shared-workflow ownership,
 // persist deletion intents before external side effects, and retain per-workflow outcomes.
 type Handler interface {
@@ -114,6 +116,19 @@ func (e *Engine) Reconcile(ctx context.Context, req Request) (Result, error) {
 		Block(req.Status, req.Generation, "InfrastructureRollbackUnsupported", "Infrastructure Rollback is unsupported; retry the failed forward action after remediation or use WCP backup and restore")
 		return Result{}, nil
 	}
+	// Validate scope before accepting a completed checkpoint, too.
+	if (req.Action == api.ActionCommit && req.Stage != Namespaces) || (req.Action == api.ActionFinalize && req.Stage != Infrastructure) {
+		Block(req.Status, req.Generation, "InvalidAction", "Requested action is not supported by this transition kind")
+		return Result{}, nil
+	}
+	if (req.Action == api.ActionCommit || req.Action == api.ActionFinalize) &&
+		req.Status.LastAction == req.Action && req.Status.ActionState == api.ActionStateSucceeded && req.Status.IrreversibleAction != string(req.Action) {
+		// Do not infer the point of no return from a success flag or replay
+		// destructive work when its durable checkpoint is missing.
+		Block(req.Status, req.Generation, "MissingIrreversibleCheckpoint", "Completed irreversible action has no persisted checkpoint; recovery requires investigation")
+		commitCondition(req, metav1.ConditionFalse, "MissingIrreversibleCheckpoint", "Namespace commit completion cannot be verified without its irreversible checkpoint")
+		return Result{}, nil
+	}
 	if req.Status.ActionState == api.ActionStateSucceeded && req.Status.ActionGeneration == req.Generation && req.Status.LastAction == req.Action {
 		req.Status.Phase = completedPhase(req.Stage, req.Action)
 		commitCondition(req, metav1.ConditionTrue, "CommitCompleted", "Namespace migration commit completed")
@@ -149,6 +164,13 @@ func (e *Engine) Reconcile(ctx context.Context, req Request) (Result, error) {
 	req.Status.Phase = activePhase(req.Action)
 	irreversible := req.Status.IrreversibleAction
 	result, err := handler.Reconcile(ctx, req)
+	if req.Status.IrreversibleAction != irreversible {
+		// A handler receives mutable status for progress reporting, but cannot
+		// create or erase the boundary that authorizes destructive work. Restore
+		// the durable value even on failure so recovery remains possible.
+		req.Status.IrreversibleAction = irreversible
+		err = errors.Join(err, fmt.Errorf("handler must not mutate irreversibleAction; return CheckpointIrreversible to request persistence"))
+	}
 	if err == nil && result.Outcome != OutcomeSucceeded && result.Outcome != OutcomeInProgress && result.Outcome != OutcomeNeedsInput && result.Outcome != OutcomeCheckpointIrreversible {
 		err = fmt.Errorf("handler returned invalid outcome %q", result.Outcome)
 	}

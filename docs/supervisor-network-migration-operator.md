@@ -6,8 +6,8 @@ NCP Pod. It owns the cluster-scoped `migration.network.vmware.com/v1alpha1` reso
 
 ## Branch scope
 
-This branch, `topic/xl018891/UBMWM-12405`, builds on
-`topic/xl018891/supervisor-network-migration-operator`. It adds action dispatch,
+This branch, `topic/xl018891/migration-commit-contract-wbs-1.1.6`, builds on
+`topic/xl018891/UBMWM-12405` and the latest framework. The parent adds action dispatch,
 persisted execution checkpoints, namespace readiness and infrastructure finalization dependency gates,
 and irreversible commit/finalize guards for
 [UBMWM-12405](https://vmw-jira.broadcom.net/browse/UBMWM-12405).
@@ -52,6 +52,36 @@ checkpoint is immutable and closes namespace rollback at Commit.
 Infrastructure Rollback is rejected independently of any irreversible checkpoint. Exact workflow IDs remain durable.
 Namespace status contains `name`, `phase`, `reason`, and `message`; milestones are batch
 conditions, and counters are derived using batch membership from spec.
+
+## Namespace Commit contract (WBS 1.1.6)
+
+This contract builds on the UBMWM-12405 dispatcher. Namespace `Commit` reports
+`Committing` until confirmed completion and then `Committed`, with the
+`NamespaceMigrationCommitted` condition. A failed attempt retains `Committing`,
+its failed action checkpoint, and workflow identities for retry. Infrastructure
+`Finalize` uses its own `Finalize` irreversible checkpoint and reports `Finalized`
+only after its handler confirms completion.
+
+`status.irreversibleAction` is engine-owned. After preflight, a handler returns
+`CheckpointIrreversible` without deleting workflows. The controller persists the
+checkpoint, and a subsequent reconciliation reads it before the handler may
+perform irreversible work. A failed checkpoint write prevents that work. Handlers
+must not assign, clear, or replace the marker directly; the engine rejects such
+updates and preserves the previous marker. After the checkpoint, only the same
+action may resume; rollback and action resets remain rejected by the dispatcher
+and CRD admission rules.
+
+A successful Commit/Finalize record without its irreversible checkpoint is not
+accepted as verified completion or replayed automatically. It is blocked for
+investigation. Terminal namespace shortcuts likewise require the Commit marker.
+
+Controller tests exercise checkpoint write failures, partial workflow deletion,
+restart recovery, and completion-status write failures using a test handler with
+recorded deletion outcomes. They cover both Commit and Finalize. The production
+NSX workflow handler, durable per-workflow deletion intents/outcomes, approval,
+onboarding, ownership checks and mutation locking remain WBS 1.3.7 and its shared
+service dependencies. No speculative `status.commit` schema or external deletion
+handler is added by this contract change.
 
 ## Design contract
 

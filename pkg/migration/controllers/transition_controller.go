@@ -76,7 +76,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, key ctrl.Request) (ctrl.Resu
 		status.ActionGeneration == obj.GetGeneration() && status.LastAction == action &&
 		((action == api.ActionExecute && status.Phase == "Completed") ||
 			(action == api.ActionRollback && status.Phase == "RolledBack") ||
-			(action == api.ActionCommit && status.Phase == "Committed")) {
+			(action == api.ActionCommit && status.Phase == "Committed" && status.IrreversibleAction == string(api.ActionCommit))) {
 		return ctrl.Result{}, nil
 	}
 	request := transition.Request{Stage: r.Stage, Object: obj, Action: action, Generation: obj.GetGeneration(), Status: status}
