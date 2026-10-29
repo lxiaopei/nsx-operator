@@ -3,7 +3,9 @@
 
 package v1alpha1
 
-import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
 // Action selects an explicit migration operation.
 // +kubebuilder:validation:Enum=Evaluate;Plan;Derive;Execute;Rollback;Commit;Finalize

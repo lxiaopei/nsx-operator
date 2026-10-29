@@ -13,9 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"sort"
+	"strings"
 
-	"github.com/vmware/vsphere-automation-sdk-go/runtime/data/serializers/cleanjson"
 	"github.com/vmware/vsphere-automation-sdk-go/services/nsxt/model"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -27,6 +26,7 @@ type Kind string
 const (
 	TransitGateway      Kind = "TransitGateway"
 	VPC                 Kind = "VPC"
+	VPCSubnet           Kind = "VPCSubnet"
 	IPBlock             Kind = "IPBlock"
 	DVC                 Kind = "DVC"
 	ConnectivityProfile Kind = "ConnectivityProfile"
@@ -38,39 +38,22 @@ const (
 type Spec struct {
 	Kind                Kind
 	ID                  string
+	DisplayName         string
 	ProjectID           string
+	VPCID               string
+	// CreateIfAbsent is set only after inspection searched the applicable shared
+	// topology (span for TGW/VPC, VDN+VLAN for DVC/subnet) and found no reusable
+	// candidate. Ensure never creates a new identity based on deterministic-path
+	// absence alone.
+	CreateIfAbsent      bool
 	AdoptUniqueID       string
-	Consumers           []Consumer
+	ExpectedUniqueID    string
 	TransitGateway      *model.TransitGateway
 	VPC                 *model.Vpc
+	VPCSubnet           *model.VpcSubnet
 	IPBlock             *model.IpAddressBlock
 	DVC                 *model.DistributedVlanConnection
 	ConnectivityProfile *model.VpcConnectivityProfile
-}
-
-// MarshalJSON includes the SDK's opaque polymorphic TGW span in the journal and
-// payload digest. encoding/json alone serializes data.StructValue as {}, losing
-// transport-zone changes and allowing a different payload to reuse an intent.
-func (s Spec) MarshalJSON() ([]byte, error) {
-	type plain Spec
-	var span json.RawMessage
-	if s.TransitGateway != nil && s.TransitGateway.Span != nil {
-		encoded, err := cleanjson.NewDataValueToJsonEncoder().Encode(s.TransitGateway.Span)
-		if err != nil {
-			return nil, err
-		}
-		span = json.RawMessage(encoded)
-	}
-	return json.Marshal(struct {
-		plain
-		Span json.RawMessage
-	}{plain(s), span})
-}
-
-type Consumer struct {
-	Kind string
-	Name string
-	UID  types.UID
 }
 
 // State is an authoritative read. Absence is explicit; read errors are never absence.
@@ -91,17 +74,17 @@ type Backend interface {
 	Apply(context.Context, Spec, types.UID) error
 }
 
-type Service struct{ Backend Backend }
+type Service struct {
+	Backend Backend
+}
 
-// Record retains creation/adoption provenance and consumer UIDs across action
-// changes. No service method deletes resources or removes consumers; cleanup must
-// also inspect all journals and live consumers, including other transition CRs.
+// Record is the result of a live reconciliation. It is returned to the caller and
+// is not persisted as a generic transition status record.
 type Record struct {
 	Path       string
 	UniqueID   string
 	Provenance string
 	Owner      types.UID
-	Consumers  []Consumer
 }
 
 func (s Spec) Path() string {
@@ -114,6 +97,8 @@ func (s Spec) Path() string {
 		return "/orgs/default/projects/" + s.ProjectID + "/transit-gateways/" + s.ID
 	case VPC:
 		return "/orgs/default/projects/" + s.ProjectID + "/vpcs/" + s.ID
+	case VPCSubnet:
+		return "/orgs/default/projects/" + s.ProjectID + "/vpcs/" + s.VPCID + "/subnets/" + s.ID
 	case ConnectivityProfile:
 		return "/orgs/default/projects/" + s.ProjectID + "/vpc-connectivity-profiles/" + s.ID
 	default:
@@ -127,9 +112,8 @@ func digest(v any) string {
 	return hex.EncodeToString(h[:16])
 }
 
-// Ensure creates/adopts/configures one resource, journaling intent first. Callers
-// supply resources in dependency order and stop on ErrPending. Every retry checks
-// live state, even if recovery.Effect already recorded the operation as Applied.
+// Ensure reconciles one deterministic NSX path from live NSX state. It does not
+// persist a generic resource inventory in the transition CR or operation journal.
 func (s *Service) Ensure(ctx context.Context, session *recovery.Session, spec Spec) (Record, error) {
 	if session == nil || s.Backend == nil {
 		return Record{}, errors.New("fabric preparation requires a recovery session and backend")
@@ -137,184 +121,97 @@ func (s *Service) Ensure(ctx context.Context, session *recovery.Session, spec Sp
 	if err := spec.Validate(); err != nil {
 		return Record{}, err
 	}
-	if session.Identity().Action != "Evaluate" && session.Identity().Action != "Derive" {
+	id := session.Identity()
+	if id.Action != "Evaluate" && id.Action != "Derive" {
 		return Record{}, errors.New("fabric preparation is only permitted during Evaluate or Derive")
 	}
-	if session.Identity().Action == "Evaluate" && spec.Kind != TransitGateway && spec.Kind != VPC {
-		return Record{}, errors.New("Evaluate container preparation cannot realize DVCs, blocks or connectivity profiles; use the dedicated SNAT bootstrap")
+	if id.Action == "Evaluate" && spec.Kind != TransitGateway && spec.Kind != VPC {
+		return Record{}, errors.New("Evaluate container preparation cannot realize DVCs, subnets, blocks or connectivity profiles; use the dedicated SNAT bootstrap")
 	}
-	if err := session.Check(ctx); err != nil {
+	if err := session.CheckMutation(ctx); err != nil {
 		return Record{}, err
-	}
-	spec.Consumers = append([]Consumer(nil), spec.Consumers...)
-	sort.Slice(spec.Consumers, func(i, j int) bool { return spec.Consumers[i].UID < spec.Consumers[j].UID })
-	path := spec.Path()
-	name := "fabric-" + digest(path)
-	history, err := session.History(ctx)
-	if err != nil {
-		return Record{}, err
-	}
-	var prior *Record
-	for _, journal := range history {
-		if value, ok := journal.Checkpoints[name+"-observed"]; ok {
-			var r Record
-			if err := json.Unmarshal(value, &r); err != nil {
-				return Record{}, err
-			}
-			if r.Path != path || r.UniqueID == "" {
-				return Record{}, errors.New("invalid fabric identity checkpoint")
-			}
-			if prior != nil && (prior.UniqueID != r.UniqueID || prior.Provenance != r.Provenance || prior.Owner != r.Owner) {
-				return Record{}, errors.New("conflicting fabric history")
-			}
-			prior = &r
-		}
 	}
 	state, err := s.Backend.Inspect(ctx, spec)
 	if err != nil {
 		return Record{}, err
 	}
-	if prior != nil && (!state.Exists || state.UniqueID != prior.UniqueID) {
-		return Record{}, fmt.Errorf("recorded fabric resource %s was removed or replaced", path)
-	}
-	record := Record{Path: path, Provenance: "Created", Owner: session.Identity().UID, Consumers: spec.Consumers}
-	if prior != nil {
-		record.Provenance = prior.Provenance
-		record.Owner = prior.Owner
-	}
 	if state.Exists {
 		if state.UniqueID == "" {
 			return Record{}, errors.New("fabric resource has no unique identity")
 		}
-		if prior == nil && state.Owner != session.Identity().UID {
-			if spec.AdoptUniqueID == "" || spec.AdoptUniqueID != state.UniqueID {
-				return Record{}, fmt.Errorf("explicit adoption identity required for %s", path)
+		if spec.ExpectedUniqueID != "" && spec.ExpectedUniqueID != state.UniqueID {
+			return Record{}, errors.New("candidate fabric identity changed")
+		}
+		if state.Owner == id.UID {
+			record := Record{Path: spec.Path(), UniqueID: state.UniqueID, Provenance: "Created", Owner: state.Owner}
+			if !state.Compatible {
+				if err := session.CheckMutation(ctx); err != nil {
+					return Record{}, err
+				}
+				spec.ExpectedUniqueID = state.UniqueID
+				if err := s.Backend.Apply(ctx, spec, id.UID); err != nil {
+					return Record{}, err
+				}
+				state, err = s.Backend.Inspect(ctx, spec)
+				if err != nil {
+					return Record{}, err
+				}
 			}
-			record.Provenance = "Adopted"
-			record.Owner = state.Owner
+			if !state.Exists || state.UniqueID != record.UniqueID || state.Owner != id.UID || !state.Compatible {
+				return Record{}, errors.New("fabric resource identity, ownership or configuration changed during reconciliation")
+			}
+			if !state.Ready {
+				return Record{}, recovery.ErrPending
+			}
+			return record, nil
 		}
-		if record.Owner != state.Owner {
-			return Record{}, errors.New("fabric ownership changed")
+		if spec.AdoptUniqueID == "" || spec.AdoptUniqueID != state.UniqueID {
+			return Record{}, fmt.Errorf("explicit live adoption identity required for %s", spec.Path())
 		}
-		if record.Provenance == "Adopted" && !state.Compatible {
+		if !state.Compatible {
 			return Record{}, errors.New("adopted fabric configuration is incompatible; it will not be modified")
 		}
-	} else if spec.AdoptUniqueID != "" {
-		return Record{}, errors.New("requested adoption resource does not exist")
-	}
-	// Persist adoption/creation decision and consumers before any external effect.
-	// Same-action retries cannot substitute a new payload or adoption decision.
-	intent := struct {
-		Spec   Spec
-		Record Record
-	}{spec, record}
-	data, err := json.Marshal(intent)
-	if err != nil {
-		return Record{}, err
-	}
-	if err := session.Checkpoint(ctx, name+"-intent", data); err != nil {
-		return Record{}, err
-	}
-	pin := func(current State) error {
-		observed := record
-		observed.UniqueID = current.UniqueID
-		data, err := json.Marshal(observed)
-		if err != nil {
-			return err
+		if !state.Ready {
+			return Record{}, recovery.ErrPending
 		}
-		return session.Checkpoint(ctx, name+"-observed", data)
+		return Record{Path: spec.Path(), UniqueID: state.UniqueID, Provenance: "Adopted", Owner: state.Owner}, nil
 	}
-	if state.Exists {
-		if err := pin(state); err != nil {
+	if spec.AdoptUniqueID != "" || spec.ExpectedUniqueID != "" {
+		return Record{}, errors.New("requested fabric candidate no longer exists")
+	}
+	if !spec.CreateIfAbsent {
+		return Record{}, errors.New("fabric creation requires completed shared-topology candidate inspection")
+	}
+	if !state.Exists || !state.Compatible {
+		if err := session.CheckMutation(ctx); err != nil {
+			return Record{}, err
+		}
+		if err := s.Backend.Apply(ctx, spec, id.UID); err != nil {
+			return Record{}, err
+		}
+		state, err = s.Backend.Inspect(ctx, spec)
+		if err != nil {
 			return Record{}, err
 		}
 	}
-	probe := func(ctx context.Context, _ string) (recovery.Observation, error) {
-		current, err := s.Backend.Inspect(ctx, spec)
-		if err != nil {
-			return recovery.Pending, err
-		}
-		if prior != nil && (!current.Exists || current.UniqueID != prior.UniqueID) {
-			return recovery.Pending, errors.New("fabric resource identity changed")
-		}
-		if current.Exists {
-			if current.Owner != record.Owner || current.UniqueID == "" {
-				return recovery.Pending, errors.New("fabric resource ownership conflict")
-			}
-			if record.Provenance == "Adopted" && current.UniqueID != spec.AdoptUniqueID && prior == nil {
-				return recovery.Pending, errors.New("adoption identity changed")
-			}
-			if err := pin(current); err != nil {
-				return recovery.Pending, err
-			}
-			if !current.Compatible {
-				if record.Provenance == "Adopted" {
-					return recovery.Pending, errors.New("adopted configuration changed")
-				}
-				return recovery.Absent, nil // desired configuration is authoritatively absent
-			}
-			if !current.Ready {
-				return recovery.Pending, nil
-			}
-			return recovery.Applied, nil
-		}
-		if record.Provenance == "Adopted" {
-			return recovery.Pending, errors.New("adopted resource disappeared")
-		}
-		return recovery.Absent, nil
-	}
-	if err := session.Effect(ctx, name, path+":"+digest(spec), probe, func(ctx context.Context, _ string) error {
-		return s.Backend.Apply(ctx, spec, session.Identity().UID)
-	}); err != nil {
-		return Record{}, err
-	}
-	observation, err := probe(ctx, "")
-	if err != nil {
-		return Record{}, err
-	}
-	if observation != recovery.Applied {
+	if !state.Exists || state.Owner != id.UID || !state.Compatible || !state.Ready {
 		return Record{}, recovery.ErrPending
 	}
-	state, err = s.Backend.Inspect(ctx, spec)
-	if err != nil {
-		return Record{}, err
-	}
-	if !state.Exists || !state.Ready || !state.Compatible || state.UniqueID == "" || state.Owner != record.Owner {
-		return Record{}, recovery.ErrPending
-	}
-	if err := pin(state); err != nil {
-		return Record{}, err
-	}
-	record.UniqueID = state.UniqueID
-	if prior != nil && record.UniqueID != prior.UniqueID {
-		return Record{}, errors.New("fabric resource replaced during verification")
-	}
-	data, err = json.Marshal(record)
-	if err != nil {
-		return Record{}, err
-	}
-	if err := session.Checkpoint(ctx, name+"-identity", data); err != nil {
-		return Record{}, err
-	}
-	return record, nil
+	return Record{Path: spec.Path(), UniqueID: state.UniqueID, Provenance: "Created", Owner: state.Owner}, nil
 }
 
 // Validate rejects malformed requests before the first effect, including read-only
 // SDK metadata. Nil managed fields retain NSX defaults; explicitly empty lists
 // request empty configuration.
 func (s Spec) Validate() error {
-	if !validID(s.ID) || (s.Kind != IPBlock && s.Kind != DVC && !validID(s.ProjectID)) || len(s.Consumers) == 0 {
-		return errors.New("fabric identity and consumer UIDs are required")
+	if !validID(s.ID) || (s.Kind != IPBlock && s.Kind != DVC && !validID(s.ProjectID)) {
+		return errors.New("fabric identity is required")
 	}
-	seen := map[types.UID]bool{}
-	for _, c := range s.Consumers {
-		if c.UID == "" || c.Name == "" || c.Kind == "" || seen[c.UID] {
-			return errors.New("invalid or duplicate fabric consumer")
-		}
-		seen[c.UID] = true
+	if s.Kind == VPCSubnet && !validID(s.VPCID) {
+		return errors.New("VPC subnet requires a valid VPC ID")
 	}
-	payloads := []any{s.TransitGateway, s.VPC, s.IPBlock, s.DVC, s.ConnectivityProfile}
-	kinds := []Kind{TransitGateway, VPC, IPBlock, DVC, ConnectivityProfile}
+	payloads := []any{s.TransitGateway, s.VPC, s.VPCSubnet, s.IPBlock, s.DVC, s.ConnectivityProfile}
+	kinds := []Kind{TransitGateway, VPC, VPCSubnet, IPBlock, DVC, ConnectivityProfile}
 	count := 0
 	for i, p := range payloads {
 		v := reflect.ValueOf(p)
@@ -328,10 +225,19 @@ func (s Spec) Validate() error {
 		v = v.Elem()
 		for j := 0; j < v.NumField(); j++ {
 			field := v.Type().Field(j).Name
+			if field == "DisplayName" {
+				if !v.Field(j).IsNil() {
+					return errors.New("set the requested fabric display name through Spec.DisplayName")
+				}
+				continue
+			}
 			if !ManagedField(s.Kind, field) && !v.Field(j).IsZero() {
 				return fmt.Errorf("fabric payload must not set server or unsupported field %s", field)
 			}
 		}
+	}
+	if s.DisplayName != "" && s.DisplayName != s.ID {
+		return errors.New("fabric display name must match its ID")
 	}
 	if count != 1 {
 		return errors.New("exactly one fabric payload is required")
@@ -344,6 +250,14 @@ func (s Spec) Validate() error {
 		availability := dvc.RestrictedAvailability
 		if availability == nil || ((availability.SpanPath == nil || *availability.SpanPath == "") && len(availability.ZoneExternalIds) == 0) {
 			return errors.New("migration DVC requires resolved zone/span availability")
+		}
+	}
+	if s.VPCSubnet != nil {
+		if s.VPCSubnet.VlanConnection == nil || !strings.HasPrefix(*s.VPCSubnet.VlanConnection, "/infra/distributed-vlan-connections/") {
+			return errors.New("VPC subnet requires a valid DVC VLAN connection path")
+		}
+		if s.VPCSubnet.AccessMode == nil || *s.VPCSubnet.AccessMode != model.VpcSubnet_ACCESS_MODE_PUBLIC {
+			return errors.New("migration VLAN extension subnet requires Public access mode")
 		}
 	}
 	return nil
@@ -368,11 +282,12 @@ func validID(id string) bool {
 // All other fields, including revision and external-controller metadata, survive updates.
 func ManagedField(kind Kind, field string) bool {
 	fields := map[Kind][]string{
-		TransitGateway:      {"Span", "ExternalIpSignalingMode", "TransitSubnets"},
-		VPC:                 {"ExternalIpv4Blocks", "IpAddressType", "PrivateIps", "Ipv6ProfilePaths", "LoadBalancerVpcEndpoint", "VpcServiceProfile"},
-		IPBlock:             {"Cidrs", "Ranges", "ExcludedIps", "IpAddressType", "Visibility"},
-		DVC:                 {"AssociatedIpBlockPaths", "GatewayAddresses", "RestrictedAvailability", "SubnetExtensionConnection", "VlanId"},
-		ConnectivityProfile: {"ExternalIpBlocks", "Ipv6Blocks", "PrivateTgwIpBlocks", "ServiceGateway", "TransitGatewayPath"},
+		TransitGateway:      {"DisplayName", "Span", "ExternalIpSignalingMode", "TransitSubnets"},
+		VPC:                 {"DisplayName", "ExternalIpv4Blocks", "IpAddressType", "PrivateIps", "Ipv6ProfilePaths", "LoadBalancerVpcEndpoint", "VpcServiceProfile", "TransitGatewayPath"},
+		VPCSubnet:           {"DisplayName", "AccessMode", "IpAddressType", "IpAddresses", "IpBlocks", "Ipv4SubnetSize", "Ipv6PrefixLength", "VlanConnection"},
+		IPBlock:             {"DisplayName", "Cidrs", "Ranges", "ExcludedIps", "IpAddressType", "Visibility"},
+		DVC:                 {"DisplayName", "AssociatedIpBlockPaths", "GatewayAddresses", "RestrictedAvailability", "SubnetExtensionConnection", "VlanId"},
+		ConnectivityProfile: {"DisplayName", "ExternalIpBlocks", "Ipv6Blocks", "PrivateTgwIpBlocks", "ServiceGateway", "TransitGatewayPath"},
 	}
 	for _, f := range fields[kind] {
 		if f == field {

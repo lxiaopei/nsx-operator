@@ -161,29 +161,50 @@ migration uses the same namespace transition API without VCFA onboarding.
 ## WBS 1.4.3 fabric preparation
 
 `pkg/migration/fabric.Service.Ensure` prepares one resource in dependency order
-under a `recovery.Session`. The caller supplies inspected DVS/transport-zone data
-and reviewed topology. The NSX adapter in `pkg/nsx/services/migration/fabric.go`
-uses typed Policy clients for TGWs, VPCs, infra IPBlocks, DVCs and VPC connectivity
-profiles. DVC requests require a resolved VLAN, zone/span availability and the
-SDK value `ENABLED_L2_AND_L3` (the design prose calls this L2/L3 extension).
-Evaluate container preparation allows TGWs/VPCs; DVCs, ordinary blocks
-and connectivity profiles require Derive. The dedicated SNAT sequence is separate.
+under a `recovery.Session`. The caller supplies inspected DVS/transport-zone data,
+the reviewed topology, and any compatible candidate found during inspection. The
+NSX adapter in `pkg/nsx/services/migration/fabric.go` uses typed Policy clients
+for TGWs, VPCs, VPC subnets, infra IPBlocks, DVCs and VPC connectivity profiles.
+DVC requests require a resolved VLAN, zone/span availability and the SDK value
+`ENABLED_L2_AND_L3` (the design prose calls this L2/L3 extension). A VLAN-extension
+subnet references its DVC; all same-VLAN DVPGs in one VDN share that single subnet
+and DVC. Evaluate container preparation allows TGWs/VPCs; DVCs, subnets, ordinary
+blocks and connectivity profiles require Derive. The dedicated SNAT sequence is
+separate.
 
-Creation uses stable IDs and ownership tags; existing resources require matching
-ownership or an explicit adoption unique ID and compatible configuration. Adopted
-resources are never modified. Owned configuration updates preserve unmanaged SDK
-fields and carry the observed revision into PUT. Policy errors are not absence,
-and successful submission is not readiness: realization must be observed. Explicitly empty
-managed configuration lists request empty configuration. Omitted (nil) lists and
-optional scalar fields retain NSX defaults/current values, including TGW transit
-subnets supplied by NSX.
+Names are stable NSX IDs, and the same value is written as the display name. A
+missing optional override is resolved by the caller using the generated naming
+pattern. Existing topology candidates are re-read by deterministic path and checked
+for their live unique ID, ownership, managed configuration and realization before
+reuse. An adopted/shared candidate must be explicitly identified and is read-only;
+an incompatible candidate is never renamed or modified. The service only updates
+resources owned by the current transition, preserves unmanaged SDK fields and
+carries the observed revision into PUT. Policy errors are not absence, and
+successful submission is not readiness: realization must be observed. Explicitly
+empty managed configuration lists request empty configuration. Omitted (nil) lists
+and optional scalar fields retain NSX defaults/current values.
 
-Journals retain creation/adoption intent, payload, consumers and NSX unique IDs,
-including identities observed before realization completes. Replaced/deleted
-recorded resources block recovery instead of being recreated. Every reuse checks
-live readiness even when the effect journal already says Applied. Consumer records
-are retained per operation; cleanup must consult all journals and live consumers,
-including other transition CRs. This service does not delete shared resources.
+The service will not create a new ID merely because its deterministic path is
+absent. A caller must set `Spec.CreateIfAbsent` only after searching the relevant
+shared topology (span for TGW/VPC, VDN and VLAN for DVC/subnet) and finding no
+compatible reusable candidate. This keeps a missed candidate from silently
+creating duplicate shared topology. Candidate search and action-handler
+integration are still pending; until they are connected, this service is not a
+standalone migration executor.
+
+Ordinary prerequisite recovery uses deterministic NSX paths, ownership tags and
+live GET/realization checks; it does not add a generic resource inventory,
+provenance, or per-resource consumers to transition status or the operation
+journal. This follows the current API contract: conversion workflow outputs are
+read from NSX using the stored `nsxWorkflows[].workflowId`. The service does not
+delete shared resources. Any cleanup path must first verify live dependencies and
+ownership across transition resources.
+
+Acquiring a mutation session creates only the shared lock. Fabric preparation does
+not create a `migration-op-<hash>` ConfigMap. The framework creates an operation
+journal lazily when an action needs a journaled effect, a recovery checkpoint or a
+verified completion snapshot. Source-IPAM/SNAT recovery still uses that journal;
+removing it from those workflows is a separate change from NSX resource reconciliation.
 
 `NetOperatorSource.Reserve` uses the installed Net Operator API: `poolRef` references
 a namespaced **Network**, not an IPPool. It creates a deterministic source allocation
@@ -224,21 +245,33 @@ not a replacement for pre-cutover dataplane/traffic validation.
   A verified target adapter must implement singleton-block compatibility, exact
   target allocation and LB SNAT readiness; none is invented or enabled here.
 - Source inspection and approved Plan synthesis must provide VLAN/zone identities,
-  topology dependencies, full managed configuration and consumer UIDs. VPC/TGW
-  attachments and workflow conversion remain coordinated with their owning services.
+  topology dependencies, and full managed configuration. VPC/TGW attachments and
+  workflow conversion remain coordinated with their owning services.
+- `migration.SetupWithManager` currently registers the framework with no concrete
+  action handlers. Applying Evaluate or Derive therefore reports
+  `ActionNotImplemented`; this branch supplies the fabric reconciliation component,
+  not a live transition executor. WBS 1.4.2 inspection currently does not provide
+  the full NSX shared-topology candidate search required to set `CreateIfAbsent`;
+  that result and the approved topology must be passed into this service before
+  enabling those handlers.
+- The SNAT service has no production source/target backend registered here. The
+  Stage 1 SNAT flow remains gated on the verified Net Operator and target LB API
+  contracts described above.
 
 The source-IPAM Role grants only Network reads and allocation get/create in
 `vmware-system-netop`, bound to the NCP ServiceAccount in `vmware-system-nsx`.
-The RBAC kustomization preserves each resource's explicit namespace. No new CRD
-fields or normal networking-controller behavior are introduced.
+The RBAC kustomization preserves each resource's explicit namespace. The CRDs do
+not expose generic fabric resource inventories or consumer/provenance records;
+normal networking-controller behavior is unchanged.
 
 ### Opt-in live NSX harness
 
 `pkg/nsx/services/migration/fabric_integration_test.go` runs real NSX VPC/TGW
 create-and-realize, no-write reuse, explicit adoption and foreign-owner rejection
-checks. It reconstructs a **local fake Kubernetes client** from serialized recovery
-journals to simulate service restart. It does not test Kubernetes API-server CAS,
-a real controller restart, Net Operator allocation, DVC conversion, SNAT or traffic.
+checks. It reconstructs a **local fake Kubernetes client** from lock ConfigMaps to
+simulate service restart; fabric identity is re-read from NSX. It does not test
+Kubernetes API-server CAS, a real controller restart, Net Operator allocation,
+DVC/subnet conversion, SNAT or traffic.
 
 Download the Jenkins `testbedInfo.json` to a private local file (mode 0600). The
 harness reads `nsxmanager["1"]` credentials from that file; do not put credentials
@@ -338,7 +371,7 @@ Project responses; no live migration has been run for this change.
 - The current implementation serializes all Supervisor migration mutations. This
   is deliberately more conservative than independent DVS/VPC locks and prevents
   shared topology effects from overlapping. Lock contention remains retryable.
-- `migration-op-<identity hash>` journals preserve immutable named recovery
+- `migration-op-<identity hash>` journals are created on demand and preserve immutable named recovery
   checkpoints (such as original backing and resource provenance), external-effect
   intents, outcomes, verified completion, and confirmation of persisted CR status.
   Corrected Evaluate and namespace rollback retain previous journals; handlers can

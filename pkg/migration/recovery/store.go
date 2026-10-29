@@ -207,13 +207,19 @@ func (s *Store) Acquire(ctx context.Context, id Identity, scope Scope) (*Session
 		return nil, err
 	}
 	session := &Session{store: s, identity: id, fence: lock.Fence}
-	if err = session.ensureJournal(ctx); err != nil {
+	// Validate an existing journal, but idempotent reconciliation needs only the lock.
+	var journal Journal
+	if _, err = s.read(ctx, id.ID(), &journal); err != nil && !apierrors.IsNotFound(err) {
 		return nil, err
+	}
+	if err == nil && journal.Identity != id {
+		return nil, errors.New("journal identity mismatch")
 	}
 	return session, nil
 }
 
-// Session is a fenced handle. Handlers must use Effect for external mutations and
+// Session is a fenced handle. Handlers use Effect for journaled mutations, or
+// CheckMutation with idempotent reconciliation and durable CR status identities, and
 // honor cancellation. External services must also honor its stable idempotency key
 // (or equivalent identity/ownership reconciliation); Kubernetes CAS cannot fence
 // an already-in-flight NSX/vCenter request on its own.
@@ -241,6 +247,25 @@ func (s *Session) lock(ctx context.Context) (*corev1.ConfigMap, Lock, error) {
 }
 
 func (s *Session) Check(ctx context.Context) error { _, _, err := s.lock(ctx); return err }
+
+// CheckMutation fences idempotent external reconciliation without writing a
+// per-effect journal. The caller must durably retain accepted resource identities.
+func (s *Session) CheckMutation(ctx context.Context) error {
+	if err := s.Check(ctx); err != nil {
+		return err
+	}
+	if err := s.checkRequest(ctx); err != nil {
+		return err
+	}
+	verified, err := s.Verified(ctx)
+	if err != nil {
+		return err
+	}
+	if verified {
+		return errors.New("cannot mutate a verified operation")
+	}
+	return nil
+}
 
 func (s *Session) ensureJournal(ctx context.Context) error {
 	var journal Journal
@@ -352,6 +377,9 @@ func (s *Session) Effect(ctx context.Context, name, target string, probe func(co
 	if err := s.Check(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureJournal(ctx); err != nil {
+		return err
+	}
 	var j Journal
 	cm, err := s.store.read(ctx, s.identity.ID(), &j)
 	if err != nil {
@@ -421,6 +449,9 @@ func (s *Session) VerifyCompletion(ctx context.Context, completion json.RawMessa
 	if err := s.Check(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureJournal(ctx); err != nil {
+		return err
+	}
 	var j Journal
 	cm, err := s.store.read(ctx, s.identity.ID(), &j)
 	if err != nil {
@@ -461,6 +492,9 @@ func (s *Store) Finish(ctx context.Context, id Identity) error {
 	}
 	var j Journal
 	journalCM, err := s.read(ctx, id.ID(), &j)
+	if apierrors.IsNotFound(err) {
+		return errors.New("cannot release unverified migration operation")
+	}
 	if err != nil {
 		return err
 	}
@@ -508,6 +542,9 @@ func (s *Session) Verified(ctx context.Context) (bool, error) {
 	}
 	var j Journal
 	_, err := s.store.read(ctx, s.identity.ID(), &j)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
 	return j.Verified, err
 }
 
@@ -519,6 +556,9 @@ func (s *Session) Checkpoint(ctx context.Context, name string, value json.RawMes
 		return errors.New("invalid recovery checkpoint")
 	}
 	if err := s.Check(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureJournal(ctx); err != nil {
 		return err
 	}
 	var j Journal
@@ -579,7 +619,7 @@ func (s *Session) checkRequest(ctx context.Context) error {
 			status = &v.Status.TransitionStatus
 		}
 	}
-	if obj.GetUID() != s.identity.UID || obj.GetGeneration() != s.identity.Generation || string(action) != s.identity.Action {
+	if !obj.GetDeletionTimestamp().IsZero() || obj.GetUID() != s.identity.UID || obj.GetGeneration() != s.identity.Generation || string(action) != s.identity.Action {
 		return ErrFenced
 	}
 	if action == api.ActionCommit || action == api.ActionFinalize {

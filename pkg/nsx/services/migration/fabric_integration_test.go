@@ -37,7 +37,7 @@ import (
 )
 
 // TestFabricNSXIntegration is opt-in and mutates only uniquely named test resources.
-// NSX calls are real; Kubernetes objects/journals use a local fake client. It does
+// NSX calls are real; Kubernetes status and lock objects use a local fake client. It does
 // not validate API-server persistence, Net Operator, SNAT, or migration traffic.
 // Credentials are read from the Jenkins artifact file, never command-line arguments.
 func TestFabricNSXIntegration(t *testing.T) {
@@ -98,14 +98,13 @@ func TestFabricNSXIntegration(t *testing.T) {
 	writeReport()
 	t.Logf("live run %s in project %s; report contains test paths and cleanup results", runID, project)
 
-	specs := []fabric.Spec{{Kind: fabric.VPC, ID: runID + "-vpc", ProjectID: project, VPC: &model.Vpc{IpAddressType: ptr.To("IPV4")}}}
+	specs := []fabric.Spec{{Kind: fabric.VPC, ID: runID + "-vpc", ProjectID: project, CreateIfAbsent: true, VPC: &model.Vpc{IpAddressType: ptr.To("IPV4")}}}
 	// TGW uses only the pre-existing span, not its transit ranges or attachments.
 	// No namespace/workload is attached to the disposable TGW or VPC.
 	existing, err := c.TransitGatewayClient.Get("default", project, "default")
 	require.NoError(t, err)
-	specs = append(specs, fabric.Spec{Kind: fabric.TransitGateway, ID: runID + "-tgw", ProjectID: project, TransitGateway: &model.TransitGateway{Span: existing.Span, ExternalIpSignalingMode: ptr.To("NONE")}})
+	specs = append(specs, fabric.Spec{Kind: fabric.TransitGateway, ID: runID + "-tgw", ProjectID: project, CreateIfAbsent: true, TransitGateway: &model.TransitGateway{Span: existing.Span, ExternalIpSignalingMode: ptr.To("NONE")}})
 	for _, spec := range specs {
-		spec.Consumers = []fabric.Consumer{{Kind: "ControlPlaneNetworkTransition", Name: api.ControlPlaneNetworkTransitionName, UID: owner}}
 		t.Run(string(spec.Kind), func(t *testing.T) {
 			result := liveFabricCase{Kind: string(spec.Kind), Path: spec.Path()}
 			report.Cases = append(report.Cases, result)
@@ -135,7 +134,7 @@ func TestFabricNSXIntegration(t *testing.T) {
 			require.Equal(t, record.UniqueID, record2.UniqueID)
 			require.Equal(t, writes, backend.writes)
 			out.Reused = true
-			// Rebuild the local client from a JSON journal snapshot, then reacquire ownership.
+			// Rebuild from serialized lock state, then reacquire ownership and inspect NSX.
 			var journals corev1.ConfigMapList
 			require.NoError(t, store.Client.List(ctx, &journals))
 			snapshot, err := json.Marshal(journals.Items)
@@ -200,7 +199,7 @@ func liveSession(t *testing.T, owner types.UID, records []corev1.ConfigMap) (*re
 	for i := range records {
 		objects = append(objects, records[i].DeepCopy())
 	}
-	k := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	k := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(obj).WithObjects(objects...).Build()
 	store := &recovery.Store{Client: k, Reader: k}
 	session, err := store.Acquire(context.Background(), recovery.Identity{UID: owner, Name: obj.Name, Kind: "ControlPlaneNetworkTransition", Action: "Evaluate", Generation: 1}, recovery.Scope{AllNamespaces: true})
 	require.NoError(t, err)

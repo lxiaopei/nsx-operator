@@ -50,6 +50,11 @@ func readFabric(c *nsx.Client, s fabric.Spec) (any, error) {
 			return nil, errors.New("NSX VPC client unavailable")
 		}
 		return c.VPCClient.Get("default", s.ProjectID, s.ID)
+	case fabric.VPCSubnet:
+		if c.SubnetsClient == nil {
+			return nil, errors.New("NSX VPC subnet client unavailable")
+		}
+		return c.SubnetsClient.Get("default", s.ProjectID, s.VPCID, s.ID)
 	case fabric.IPBlock:
 		if c.RestConnector == nil {
 			return nil, errors.New("NSX Policy connector unavailable")
@@ -76,21 +81,38 @@ func isMissing(err error) bool {
 	return errors.As(err, &value) || errors.As(err, &pointer)
 }
 
-func desiredFabric(s fabric.Spec) any {
+func desiredFabric(s fabric.Spec, creating bool) any {
+	var payload any
 	switch s.Kind {
 	case fabric.TransitGateway:
-		return *s.TransitGateway
+		payload = *s.TransitGateway
 	case fabric.VPC:
-		return *s.VPC
+		payload = *s.VPC
+	case fabric.VPCSubnet:
+		payload = *s.VPCSubnet
 	case fabric.IPBlock:
-		return *s.IPBlock
+		payload = *s.IPBlock
 	case fabric.DVC:
-		return *s.DVC
+		payload = *s.DVC
 	case fabric.ConnectivityProfile:
-		return *s.ConnectivityProfile
+		payload = *s.ConnectivityProfile
 	default:
 		return nil
 	}
+	value := reflect.ValueOf(payload)
+	normalized := reflect.New(value.Type()).Elem()
+	normalized.Set(value)
+	normalized.FieldByName("Id").Set(reflect.ValueOf(ptr.To(s.ID)))
+	displayName := s.DisplayName
+	if creating && displayName == "" {
+		displayName = s.ID
+	}
+	if displayName == "" {
+		normalized.FieldByName("DisplayName").Set(reflect.Zero(normalized.FieldByName("DisplayName").Type()))
+	} else {
+		normalized.FieldByName("DisplayName").Set(reflect.ValueOf(ptr.To(displayName)))
+	}
+	return normalized.Interface()
 }
 
 // The SDK resource structs have common typed metadata but no shared Go interface.
@@ -120,7 +142,7 @@ func fabricState(s fabric.Spec, obj any) (fabric.State, error) {
 			state.Owner = types.UID(*tag.Tag)
 		}
 	}
-	desired := reflect.ValueOf(desiredFabric(s))
+	desired := reflect.ValueOf(desiredFabric(s, false))
 	for i := 0; i < v.NumField(); i++ {
 		if !fabric.ManagedField(s.Kind, v.Type().Field(i).Name) {
 			continue
@@ -211,10 +233,14 @@ func (b *FabricBackend) Apply(ctx context.Context, s fabric.Spec, owner types.UI
 		return err
 	}
 	var value reflect.Value
+	creating := false
 	if err == nil {
 		state, err := fabricState(s, obj)
 		if err != nil {
 			return err
+		}
+		if s.ExpectedUniqueID != "" && state.UniqueID != s.ExpectedUniqueID {
+			return errors.New("fabric resource identity changed")
 		}
 		if state.Owner != owner {
 			return errors.New("refusing to modify fabric owned by another controller")
@@ -226,12 +252,16 @@ func (b *FabricBackend) Apply(ctx context.Context, s fabric.Spec, owner types.UI
 		value = reflect.New(reflect.TypeOf(obj)).Elem()
 		value.Set(reflect.ValueOf(obj))
 	} else {
-		desired := desiredFabric(s)
+		if s.ExpectedUniqueID != "" {
+			return errors.New("recorded fabric resource disappeared")
+		}
+		creating = true
+		desired := desiredFabric(s, creating)
 		value = reflect.New(reflect.TypeOf(desired)).Elem()
 		value.FieldByName("Id").Set(reflect.ValueOf(ptr.To(s.ID)))
 		value.FieldByName("Tags").Set(reflect.ValueOf([]model.Tag{{Scope: ptr.To(fabricOwnerScope), Tag: ptr.To(string(owner))}}))
 	}
-	desired := reflect.ValueOf(desiredFabric(s))
+	desired := reflect.ValueOf(desiredFabric(s, creating))
 	for i := 0; i < value.NumField(); i++ {
 		if fabric.ManagedField(s.Kind, value.Type().Field(i).Name) {
 			if (desired.Field(i).Kind() == reflect.Pointer || desired.Field(i).Kind() == reflect.Slice) && desired.Field(i).IsNil() {
@@ -250,6 +280,8 @@ func (b *FabricBackend) Apply(ctx context.Context, s fabric.Spec, owner types.UI
 		_, err = c.TransitGatewayClient.Update("default", s.ProjectID, s.ID, value.Interface().(model.TransitGateway))
 	case fabric.VPC:
 		_, err = c.VPCClient.Update("default", s.ProjectID, s.ID, value.Interface().(model.Vpc))
+	case fabric.VPCSubnet:
+		_, err = c.SubnetsClient.Update("default", s.ProjectID, s.VPCID, s.ID, value.Interface().(model.VpcSubnet))
 	case fabric.IPBlock:
 		_, err = infra.NewIpBlocksClient(c.RestConnector).Update(s.ID, value.Interface().(model.IpAddressBlock))
 	case fabric.DVC:
