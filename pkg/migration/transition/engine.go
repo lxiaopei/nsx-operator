@@ -6,6 +6,8 @@ package transition
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	api "github.com/vmware-tanzu/nsx-operator/pkg/apis/migration/v1alpha1"
+	"github.com/vmware-tanzu/nsx-operator/pkg/migration/recovery"
 )
 
 // Stage identifies the infrastructure or namespace orchestration boundary.
@@ -35,6 +38,10 @@ type Request struct {
 	Action     api.Action
 	Generation int64
 	Status     *api.TransitionStatus
+	// Prepare acquires durable ownership after action validation and before invoking handlers.
+	Prepare func(context.Context, Request) (*recovery.Session, error)
+	// Execution journals external effects; production handlers must use it.
+	Execution *recovery.Session
 }
 
 // Outcome distinguishes completion, ongoing work, and a wait for administrator input.
@@ -62,10 +69,13 @@ type Result struct {
 // Handler performs one resumable action. It must use stable external identifiers
 // and tolerate replay after a crash or status update conflict.
 // Returned errors are published in status and must not contain credentials or tokens.
-// Concrete mutating handlers must acquire a durable cluster-wide transition lock,
-// install lifecycle admission guards, and ensure finalizer cleanup before acting.
+// Production controller registration supplies Execution under a durable lock and
+// recovery finalizer, after confirming required admission protection. Handlers
+// must journal effects through Execution, verify live dependencies and consistency,
+// and return Succeeded only after completing their external verification gates.
 // Commit and Finalize must return CheckpointIrreversible after preflight checks,
 // then wait for the persisted irreversibleAction before irreversible changes.
+// irreversibleAction is engine-owned; handlers must not assign or clear it.
 // Commit handlers must verify approval/onboarding and shared-workflow ownership,
 // persist deletion intents before external side effects, and retain per-workflow outcomes.
 type Handler interface {
@@ -114,6 +124,19 @@ func (e *Engine) Reconcile(ctx context.Context, req Request) (Result, error) {
 		Block(req.Status, req.Generation, "InfrastructureRollbackUnsupported", "Infrastructure Rollback is unsupported; retry the failed forward action after remediation or use WCP backup and restore")
 		return Result{}, nil
 	}
+	// Validate scope before accepting a completed checkpoint, too.
+	if (req.Action == api.ActionCommit && req.Stage != Namespaces) || (req.Action == api.ActionFinalize && req.Stage != Infrastructure) {
+		Block(req.Status, req.Generation, "InvalidAction", "Requested action is not supported by this transition kind")
+		return Result{}, nil
+	}
+	if (req.Action == api.ActionCommit || req.Action == api.ActionFinalize) &&
+		req.Status.LastAction == req.Action && req.Status.ActionState == api.ActionStateSucceeded && req.Status.IrreversibleAction != string(req.Action) {
+		// Do not infer the point of no return from a success flag or replay
+		// destructive work when its durable checkpoint is missing.
+		Block(req.Status, req.Generation, "MissingIrreversibleCheckpoint", "Completed irreversible action has no persisted checkpoint; recovery requires investigation")
+		commitCondition(req, metav1.ConditionFalse, "MissingIrreversibleCheckpoint", "Namespace commit completion cannot be verified without its irreversible checkpoint")
+		return Result{}, nil
+	}
 	if req.Status.ActionState == api.ActionStateSucceeded && req.Status.ActionGeneration == req.Generation && req.Status.LastAction == req.Action {
 		req.Status.Phase = completedPhase(req.Stage, req.Action)
 		commitCondition(req, metav1.ConditionTrue, "CommitCompleted", "Namespace migration commit completed")
@@ -148,7 +171,36 @@ func (e *Engine) Reconcile(ctx context.Context, req Request) (Result, error) {
 	req.Status.ActionState = api.ActionStateRunning
 	req.Status.Phase = activePhase(req.Action)
 	irreversible := req.Status.IrreversibleAction
-	result, err := handler.Reconcile(ctx, req)
+	var result Result
+	var err error
+	if req.Prepare != nil {
+		req.Execution, err = req.Prepare(ctx, req)
+	}
+	if err == nil {
+		verified := false
+		if req.Execution != nil {
+			verified, err = req.Execution.Verified(ctx)
+		}
+		if err == nil {
+			if verified {
+				var snapshot json.RawMessage
+				snapshot, err = req.Execution.Completion(ctx)
+				if err == nil {
+					err = restoreStatus(req, snapshot)
+				}
+				result.Outcome = OutcomeSucceeded
+			} else {
+				result, err = handler.Reconcile(ctx, req)
+			}
+		}
+	}
+	if req.Status.IrreversibleAction != irreversible {
+		// A handler receives mutable status for progress reporting, but cannot
+		// create or erase the boundary that authorizes destructive work. Restore
+		// the durable value even on failure so recovery remains possible.
+		req.Status.IrreversibleAction = irreversible
+		err = errors.Join(err, fmt.Errorf("handler must not mutate irreversibleAction; return CheckpointIrreversible to request persistence"))
+	}
 	if err == nil && result.Outcome != OutcomeSucceeded && result.Outcome != OutcomeInProgress && result.Outcome != OutcomeNeedsInput && result.Outcome != OutcomeCheckpointIrreversible {
 		err = fmt.Errorf("handler returned invalid outcome %q", result.Outcome)
 	}
@@ -157,6 +209,13 @@ func (e *Engine) Reconcile(ctx context.Context, req Request) (Result, error) {
 	}
 	if err == nil && result.Outcome == OutcomeSucceeded && (req.Action == api.ActionCommit || req.Action == api.ActionFinalize) && irreversible != string(req.Action) {
 		err = fmt.Errorf("action %s cannot succeed without a persisted irreversible checkpoint", req.Action)
+	}
+	if err == nil && result.Outcome == OutcomeSucceeded && req.Execution != nil {
+		var snapshot []byte
+		snapshot, err = json.Marshal(statusSnapshot(req))
+		if err == nil {
+			err = req.Execution.VerifyCompletion(ctx, snapshot)
+		}
 	}
 	if err != nil {
 		req.Status.ActionState = api.ActionStateFailed
@@ -294,4 +353,44 @@ func completedPhase(stage Stage, action api.Action) string {
 	}
 	return map[api.Action]string{api.ActionEvaluate: "Evaluated", api.ActionPlan: "PlanReady", api.ActionDerive: "Derived",
 		api.ActionExecute: "Completed", api.ActionRollback: "RolledBack", api.ActionCommit: "Committed", api.ActionFinalize: "Finalized"}[action]
+}
+
+// Preserve the complete kind-specific status, including workflow IDs, namespace
+// progress and SNAT identities, if publishing verified completion must be retried.
+func statusSnapshot(req Request) any {
+	switch obj := req.Object.(type) {
+	case *api.ControlPlaneNetworkTransition:
+		if obj.Status != nil {
+			return obj.Status
+		}
+	case *api.NamespaceNetworkTransition:
+		if obj.Status != nil {
+			return obj.Status
+		}
+	}
+	return req.Status
+}
+
+func restoreStatus(req Request, snapshot []byte) error {
+	switch target := statusSnapshot(req).(type) {
+	case *api.ControlPlaneNetworkTransitionStatus:
+		var saved api.ControlPlaneNetworkTransitionStatus
+		if err := json.Unmarshal(snapshot, &saved); err != nil {
+			return err
+		}
+		*target = saved
+	case *api.NamespaceNetworkTransitionStatus:
+		var saved api.NamespaceNetworkTransitionStatus
+		if err := json.Unmarshal(snapshot, &saved); err != nil {
+			return err
+		}
+		*target = saved
+	case *api.TransitionStatus:
+		var saved api.TransitionStatus
+		if err := json.Unmarshal(snapshot, &saved); err != nil {
+			return err
+		}
+		*target = saved
+	}
+	return nil
 }

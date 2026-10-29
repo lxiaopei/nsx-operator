@@ -9,6 +9,7 @@ NCP Pod. It owns the cluster-scoped `migration.network.vmware.com/v1alpha1` reso
 This branch, `topic/xl018891/UBMWM-12405`, builds on
 `topic/xl018891/supervisor-network-migration-operator`. It adds action dispatch,
 persisted execution checkpoints, namespace readiness and infrastructure finalization dependency gates,
+durable mutation serialization and operation recovery,
 and irreversible commit/finalize guards for
 [UBMWM-12405](https://vmw-jira.broadcom.net/browse/UBMWM-12405).
 The base branch retains the manager, observational watches, lazy NSX connectivity,
@@ -154,6 +155,84 @@ an explicitly selected project or a find-or-create project named after the
 namespace. These mappings are not additional transition CR inputs. VC-only
 migration uses the same namespace transition API without VCFA onboarding.
 
+## WBS 1.4.9 action, locking and recovery runtime
+
+`pkg/migration/recovery` stores versioned private ConfigMap records in
+`vmware-system-nsx`. No additional transition CRD fields are introduced.
+
+- `supervisor-network-migration-lock` is the single authoritative record for both
+  mutation ownership and `admissionProtectionActive`. It records the holder CR
+  UID, kind/name, action/generation, fencing counter, namespace UID scope, and
+  checkpoint. There is no TTL takeover. A lock alone does not activate protection.
+- The current implementation serializes all Supervisor migration mutations. This
+  is deliberately more conservative than independent DVS/VPC locks and prevents
+  shared topology effects from overlapping. Lock contention remains retryable.
+- `migration-op-<identity hash>` journals preserve immutable named recovery
+  checkpoints (such as original backing and resource provenance), external-effect
+  intents, outcomes, verified completion, and confirmation of persisted CR status.
+  Corrected Evaluate and namespace rollback retain previous journals; handlers can
+  inspect them through `Execution.History`. Journals have no owner-reference GC or
+  delete permission. Retention/cleanup policy is separate work.
+- A recovery finalizer is persisted before handler execution. Deletion with an
+  active holder resumes the recorded recovery instead of releasing protection or
+  erasing evidence. Successful completion releases ownership before removal of
+  the finalizer on a subsequent deletion reconciliation.
+
+The controller acquires/reuses durable ownership and rechecks dependency gates
+before invoking a registered handler. Preparing/Evaluate, Plan and Derive keep
+admission protection inactive. Execute activates protection first. Namespace
+rollback activates or retains it if any Execute operation was recorded, including
+an uncertain attempt; preparation-only rollback leaves it inactive. Infrastructure
+scope currently conservatively includes all namespaces; namespace batches use
+resolved namespace UIDs. Active scope cannot be changed during recovery.
+
+Production handlers receive `Request.Execution`. Before an external mutation,
+record immutable recovery data with `Checkpoint` and run the mutation through
+`Effect`, supplying a stable target identity/payload digest, an authoritative
+probe, and an idempotent apply callback. The journal stores intent before apply.
+Retries probe first: Applied skips submission, Pending/unknown/errors retain the
+holder and do not authorize another call, and authoritative Absent permits apply
+with the same idempotency key. Before submission the runtime rechecks the current
+CR UID/action/generation and, for Commit/Finalize, the persisted irreversible
+checkpoint. An existing foreign resource must be reported as a conflict, never
+adopted merely because its name matches.
+
+Fencing checks reject stale sessions at journal/effect boundaries, and resource
+version preconditions reject conflicting lock updates. They cannot revoke an
+already in-flight external request: handlers must honor manager cancellation and
+use external idempotency/ownership reconciliation. This framework does not claim
+exactly-once NSX/vCenter execution. Any service lacking those guarantees must
+leave an ambiguous outcome pending for reconciliation, rather than blindly retry.
+
+A handler may return Succeeded only after verifying the full action's consistent
+state (including whole-batch restoration and plan invalidation for Rollback).
+The engine rejects unresolved journal effects, persists verification, and then
+the controller persists CR success. Release proceeds as separate recoverable
+writes: record completion, clear protection, release holder. Failure, NeedsInput,
+timeout, or restart does not clear protection. If CR status persistence fails after
+verification, restart restores the complete handler-produced status snapshot
+(including workflow and allocation identities) and publishes success without
+repeating the handler. A client
+requesting the next action before release cannot strand the old holder.
+
+`ConfirmProtection` is an explicit integration point for WBS 1.1.4.3. It must
+confirm that deployed guards enforce the exact authoritative holder and scope;
+merely seeing a webhook configuration is insufficient. Admission consumers must
+read the authoritative lock with an uncached reader and fail closed on an
+unavailable/corrupt record. They must not infer protection from CR phase or a
+status mirror. `ConfirmFreshnessAdmission` confirms the separately tracked WBS
+1.1.4.1 deployment before Plan handlers run. Both callbacks are intentionally
+unset until their admission implementation is wired: Plan and protected execution
+fail closed, without external handler invocation. These hooks do not implement
+admission request validation themselves.
+
+The existing WBS 1.1.6 protections are also included: handlers cannot assign or
+clear `irreversibleAction`, completed Commit/Finalize records without a marker are
+rejected, and namespace terminal shortcuts require the Commit marker.
+Concrete external action handlers remain unregistered. Unit/fault-injection tests
+cover the runtime contract; end-to-end completion of WBS 1.4.9 still requires
+admission and concrete handler integration and deployment verification.
+
 ## Build and validate
 
 ```sh
@@ -205,10 +284,12 @@ removing the old Carvel package must not delete the CRDs or their instances.
 The old tera bootstrapper/build wiring is removed as part of that coordinated
 packaging change, not by this repository alone.
 
-Concrete handlers still need a durable fenced mutation lock, finalizers and
-admission protection, current NSX ownership/consumer checks, reviewed plan and
-resource provenance records, and approval/onboarding checks. Recheck dependencies
-under that lock; the dispatcher's process mutex only serializes its controllers.
+The WBS 1.4.9 runtime supplies durable mutation ownership, recovery finalizers,
+operation journals, and admission-protection coordination. Concrete handlers still
+need current NSX ownership/consumer checks, reviewed plan verification, resource
+provenance capture, and approval/onboarding checks. Admission webhooks remain the
+separate WBS 1.1.4 integration. Dependency gates are repeated under durable ownership;
+handlers must also recheck live external dependencies before each effect.
 Never duplicate normal NSX controllers or delete active VPC/LB/SNAT resources.
 `NetworkResourceTransition` support is a prerequisite for real cutover handlers;
 it is not implemented by this scaffold. Container co-location does not replace

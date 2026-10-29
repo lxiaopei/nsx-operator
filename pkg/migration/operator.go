@@ -9,6 +9,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/vmware-tanzu/nsx-operator/pkg/migration/controllers"
+	"github.com/vmware-tanzu/nsx-operator/pkg/migration/recovery"
 	"github.com/vmware-tanzu/nsx-operator/pkg/migration/transition"
 )
 
@@ -22,7 +23,7 @@ func SetupWithManager(mgr ctrl.Manager) error {
 
 func registerControllers(c client.Client, reader client.Reader, engine *transition.Engine, register func(*controllers.Reconciler) error) error {
 	for _, stage := range []transition.Stage{transition.Infrastructure, transition.Namespaces} {
-		r := &controllers.Reconciler{Client: c, APIReader: reader, Engine: engine, Stage: stage}
+		r := &controllers.Reconciler{Client: c, APIReader: reader, Engine: engine, Stage: stage, Recovery: &recovery.Store{Client: c, Reader: reader}}
 		if err := register(r); err != nil {
 			return err
 		}

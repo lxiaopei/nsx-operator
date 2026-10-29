@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	api "github.com/vmware-tanzu/nsx-operator/pkg/apis/migration/v1alpha1"
+	"github.com/vmware-tanzu/nsx-operator/pkg/migration/recovery"
 	"github.com/vmware-tanzu/nsx-operator/pkg/migration/transition"
 )
 
@@ -29,12 +30,22 @@ type Reconciler struct {
 	APIReader client.Reader
 	Engine    *transition.Engine
 	Stage     transition.Stage
+	// Recovery is required by production registration; nil is only for isolated dispatcher tests.
+	Recovery *recovery.Store
+	// ConfirmProtection is supplied by admission integration. Nil fails closed.
+	ConfirmProtection func(context.Context, recovery.Lock) error
+	// ConfirmFreshnessAdmission verifies deployment of WBS 1.1.4.1 before Plan dispatch.
+	ConfirmFreshnessAdmission func(context.Context) error
 }
 
 // +kubebuilder:rbac:groups=migration.network.vmware.com,resources=controlplanenetworktransitions;namespacenetworktransitions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=migration.network.vmware.com,resources=controlplanenetworktransitions/status;namespacenetworktransitions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;create;update,namespace=vmware-system-nsx
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;create;update,namespace=vmware-system-nsx
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list
+// +kubebuilder:rbac:groups=migration.network.vmware.com,resources=controlplanenetworktransitions;namespacenetworktransitions,verbs=patch
+// +kubebuilder:rbac:groups=migration.network.vmware.com,resources=controlplanenetworktransitions/finalizers;namespacenetworktransitions/finalizers,verbs=update
 
 // Reconcile persists observed status separately from desired state.
 func (r *Reconciler) Reconcile(ctx context.Context, key ctrl.Request) (ctrl.Result, error) {
@@ -52,8 +63,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, key ctrl.Request) (ctrl.Resu
 	if err := r.reader().Get(ctx, key.NamespacedName, obj); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if !obj.GetDeletionTimestamp().IsZero() {
-		return ctrl.Result{}, nil
+	if stop, err := r.recoveryLifecycle(ctx, obj); err != nil || stop {
+		return ctrl.Result{}, err
 	}
 	previous := obj.DeepCopyObject()
 	var status *api.TransitionStatus
@@ -70,16 +81,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, key ctrl.Request) (ctrl.Resu
 		}
 		status, action = &resource.Status.TransitionStatus, resource.Spec.Action
 	}
+	// A user may request the next action after success but before lock release.
+	// Finish the persisted previous checkpoint before accepting that next action.
+	if r.Recovery != nil && r.Engine.Enabled && status.ActionState == api.ActionStateSucceeded {
+		completed := identity(obj, status.LastAction)
+		completed.Generation = status.ActionGeneration
+		if err := r.Recovery.Finish(ctx, completed); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	// Terminal batch records are retained for audit after infrastructure finalization.
 	// New requests still pass dependency gates; recovery uses action-specific checks.
 	if r.Stage == transition.Namespaces && status.ActionState == api.ActionStateSucceeded &&
 		status.ActionGeneration == obj.GetGeneration() && status.LastAction == action &&
 		((action == api.ActionExecute && status.Phase == "Completed") ||
 			(action == api.ActionRollback && status.Phase == "RolledBack") ||
-			(action == api.ActionCommit && status.Phase == "Committed")) {
-		return ctrl.Result{}, nil
+			(action == api.ActionCommit && status.Phase == "Committed" && status.IrreversibleAction == string(api.ActionCommit))) {
+		result := ctrl.Result{}
+		if !obj.GetDeletionTimestamp().IsZero() {
+			result.RequeueAfter = time.Second
+		}
+		return result, r.finishRecovery(ctx, obj, action, status)
 	}
 	request := transition.Request{Stage: r.Stage, Object: obj, Action: action, Generation: obj.GetGeneration(), Status: status}
+	if r.Recovery != nil {
+		request.Prepare = r.prepareRecovery
+	}
 	var result transition.Result
 	var reconcileErr error
 	blocked, err := r.dependencyBlock(ctx, action, status)
@@ -100,6 +127,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, key ctrl.Request) (ctrl.Resu
 		if err := r.Status().Update(ctx, obj); err != nil {
 			return ctrl.Result{}, fmt.Errorf("persisting transition status: %w", err)
 		}
+	}
+	if reconcileErr == nil && result.Outcome == transition.OutcomeSucceeded {
+		reconcileErr = r.finishRecovery(ctx, obj, action, status)
+	}
+	if reconcileErr == nil && !obj.GetDeletionTimestamp().IsZero() && result.Outcome == transition.OutcomeSucceeded {
+		result.RequeueAfter = time.Second // Remove the finalizer only after durable release.
 	}
 	return ctrl.Result{RequeueAfter: result.RequeueAfter}, reconcileErr
 }
