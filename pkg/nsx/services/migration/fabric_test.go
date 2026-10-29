@@ -8,6 +8,7 @@ package migration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -117,4 +118,26 @@ func TestFabricSDKPreservesDefaultTransitSubnets(t *testing.T) {
 	state, err = fabricState(spec, actual)
 	require.NoError(t, err)
 	require.False(t, state.Compatible, "explicitly empty requests a change")
+}
+
+func TestFabricSDKRejectsMissingOrReplacedCheckpoint(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprint(missing), func(t *testing.T) {
+			b := &FabricBackend{Service: &Service{client: &nsx.Client{VPCClient: fabricVPCClient{
+				get: func() (model.Vpc, error) {
+					if missing {
+						return model.Vpc{}, vapierrors.NotFound{}
+					}
+					return currentVPC(), nil
+				},
+				update: func(model.Vpc) (model.Vpc, error) {
+					t.Fatal("must not mutate a missing or replaced resource")
+					return model.Vpc{}, nil
+				},
+			}}}}
+			spec := fabricSpec()
+			spec.ExpectedUniqueID = "original-uid"
+			require.Error(t, b.Apply(context.Background(), spec, "infra"))
+		})
+	}
 }

@@ -13,12 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"sort"
 
-	"github.com/vmware/vsphere-automation-sdk-go/runtime/data/serializers/cleanjson"
 	"github.com/vmware/vsphere-automation-sdk-go/services/nsxt/model"
 	"k8s.io/apimachinery/pkg/types"
 
+	api "github.com/vmware-tanzu/nsx-operator/pkg/apis/migration/v1alpha1"
 	"github.com/vmware-tanzu/nsx-operator/pkg/migration/recovery"
 )
 
@@ -40,6 +39,7 @@ type Spec struct {
 	ID                  string
 	ProjectID           string
 	AdoptUniqueID       string
+	ExpectedUniqueID    string
 	Consumers           []Consumer
 	TransitGateway      *model.TransitGateway
 	VPC                 *model.Vpc
@@ -48,30 +48,7 @@ type Spec struct {
 	ConnectivityProfile *model.VpcConnectivityProfile
 }
 
-// MarshalJSON includes the SDK's opaque polymorphic TGW span in the journal and
-// payload digest. encoding/json alone serializes data.StructValue as {}, losing
-// transport-zone changes and allowing a different payload to reuse an intent.
-func (s Spec) MarshalJSON() ([]byte, error) {
-	type plain Spec
-	var span json.RawMessage
-	if s.TransitGateway != nil && s.TransitGateway.Span != nil {
-		encoded, err := cleanjson.NewDataValueToJsonEncoder().Encode(s.TransitGateway.Span)
-		if err != nil {
-			return nil, err
-		}
-		span = json.RawMessage(encoded)
-	}
-	return json.Marshal(struct {
-		plain
-		Span json.RawMessage
-	}{plain(s), span})
-}
-
-type Consumer struct {
-	Kind string
-	Name string
-	UID  types.UID
-}
+type Consumer = api.FabricConsumerStatus
 
 // State is an authoritative read. Absence is explicit; read errors are never absence.
 // Compatible compares every managed configuration field. Ready requires realization.
@@ -91,11 +68,20 @@ type Backend interface {
 	Apply(context.Context, Spec, types.UID) error
 }
 
-type Service struct{ Backend Backend }
+// ResourceStatus persists identities in the transition status using optimistic concurrency.
+type ResourceStatus interface {
+	Load(context.Context, recovery.Identity, string) (*Record, error)
+	Save(context.Context, recovery.Identity, Record) error
+}
 
-// Record retains creation/adoption provenance and consumer UIDs across action
+type Service struct {
+	Backend Backend
+	Status  ResourceStatus
+}
+
+// Record returns creation/adoption provenance and consumer UIDs across action
 // changes. No service method deletes resources or removes consumers; cleanup must
-// also inspect all journals and live consumers, including other transition CRs.
+// also inspect all transition status records and live consumers.
 type Record struct {
 	Path       string
 	UniqueID   string
@@ -127,174 +113,94 @@ func digest(v any) string {
 	return hex.EncodeToString(h[:16])
 }
 
-// Ensure creates/adopts/configures one resource, journaling intent first. Callers
-// supply resources in dependency order and stop on ErrPending. Every retry checks
-// live state, even if recovery.Effect already recorded the operation as Applied.
+// Ensure reconciles a deterministic NSX path and persists its observed identity in
+// CR status. It does not write operation steps or payloads to the recovery journal.
+// Callers must preserve these status checkpoints when publishing action results.
 func (s *Service) Ensure(ctx context.Context, session *recovery.Session, spec Spec) (Record, error) {
-	if session == nil || s.Backend == nil {
-		return Record{}, errors.New("fabric preparation requires a recovery session and backend")
+	if session == nil || s.Backend == nil || s.Status == nil {
+		return Record{}, errors.New("fabric preparation requires a recovery session, backend and status store")
 	}
 	if err := spec.Validate(); err != nil {
 		return Record{}, err
 	}
-	if session.Identity().Action != "Evaluate" && session.Identity().Action != "Derive" {
+	id := session.Identity()
+	if id.Action != "Evaluate" && id.Action != "Derive" {
 		return Record{}, errors.New("fabric preparation is only permitted during Evaluate or Derive")
 	}
-	if session.Identity().Action == "Evaluate" && spec.Kind != TransitGateway && spec.Kind != VPC {
+	if id.Action == "Evaluate" && spec.Kind != TransitGateway && spec.Kind != VPC {
 		return Record{}, errors.New("Evaluate container preparation cannot realize DVCs, blocks or connectivity profiles; use the dedicated SNAT bootstrap")
 	}
-	if err := session.Check(ctx); err != nil {
+	if err := session.CheckMutation(ctx); err != nil {
 		return Record{}, err
 	}
-	spec.Consumers = append([]Consumer(nil), spec.Consumers...)
-	sort.Slice(spec.Consumers, func(i, j int) bool { return spec.Consumers[i].UID < spec.Consumers[j].UID })
-	path := spec.Path()
-	name := "fabric-" + digest(path)
-	history, err := session.History(ctx)
+	prior, err := s.Status.Load(ctx, id, spec.Path())
 	if err != nil {
 		return Record{}, err
 	}
-	var prior *Record
-	for _, journal := range history {
-		if value, ok := journal.Checkpoints[name+"-observed"]; ok {
-			var r Record
-			if err := json.Unmarshal(value, &r); err != nil {
-				return Record{}, err
-			}
-			if r.Path != path || r.UniqueID == "" {
-				return Record{}, errors.New("invalid fabric identity checkpoint")
-			}
-			if prior != nil && (prior.UniqueID != r.UniqueID || prior.Provenance != r.Provenance || prior.Owner != r.Owner) {
-				return Record{}, errors.New("conflicting fabric history")
-			}
-			prior = &r
-		}
-	}
-	state, err := s.Backend.Inspect(ctx, spec)
-	if err != nil {
-		return Record{}, err
-	}
-	if prior != nil && (!state.Exists || state.UniqueID != prior.UniqueID) {
-		return Record{}, fmt.Errorf("recorded fabric resource %s was removed or replaced", path)
-	}
-	record := Record{Path: path, Provenance: "Created", Owner: session.Identity().UID, Consumers: spec.Consumers}
+	record := Record{Path: spec.Path(), Provenance: "Created", Owner: id.UID, Consumers: spec.Consumers}
 	if prior != nil {
-		record.Provenance = prior.Provenance
-		record.Owner = prior.Owner
+		record.UniqueID, record.Provenance, record.Owner = prior.UniqueID, prior.Provenance, prior.Owner
 	}
-	if state.Exists {
-		if state.UniqueID == "" {
-			return Record{}, errors.New("fabric resource has no unique identity")
+	inspect := func() (State, error) {
+		state, err := s.Backend.Inspect(ctx, spec)
+		if err != nil {
+			return State{}, err
 		}
-		if prior == nil && state.Owner != session.Identity().UID {
-			if spec.AdoptUniqueID == "" || spec.AdoptUniqueID != state.UniqueID {
-				return Record{}, fmt.Errorf("explicit adoption identity required for %s", path)
+		if record.UniqueID != "" && (!state.Exists || state.UniqueID != record.UniqueID) {
+			return State{}, errors.New("recorded fabric resource was removed or replaced; identity changed")
+		}
+		if !state.Exists {
+			if spec.AdoptUniqueID != "" {
+				return State{}, errors.New("requested adoption resource does not exist")
 			}
-			record.Provenance = "Adopted"
-			record.Owner = state.Owner
+			return state, nil
+		}
+		if state.UniqueID == "" {
+			return State{}, errors.New("fabric resource has no unique identity")
+		}
+		if record.UniqueID == "" && state.Owner != id.UID {
+			if spec.AdoptUniqueID == "" || spec.AdoptUniqueID != state.UniqueID {
+				return State{}, fmt.Errorf("explicit adoption identity required for %s", record.Path)
+			}
+			record.Provenance, record.Owner = "Adopted", state.Owner
 		}
 		if record.Owner != state.Owner {
-			return Record{}, errors.New("fabric ownership changed")
+			return State{}, errors.New("fabric ownership changed")
 		}
 		if record.Provenance == "Adopted" && !state.Compatible {
-			return Record{}, errors.New("adopted fabric configuration is incompatible; it will not be modified")
+			return State{}, errors.New("adopted fabric configuration is incompatible; it will not be modified")
 		}
-	} else if spec.AdoptUniqueID != "" {
-		return Record{}, errors.New("requested adoption resource does not exist")
+		record.UniqueID = state.UniqueID
+		// Pin identity even while realization is pending and before configuring it.
+		if err := session.CheckMutation(ctx); err != nil {
+			return State{}, err
+		}
+		if err := s.Status.Save(ctx, id, record); err != nil {
+			return State{}, err
+		}
+		return state, nil
 	}
-	// Persist adoption/creation decision and consumers before any external effect.
-	// Same-action retries cannot substitute a new payload or adoption decision.
-	intent := struct {
-		Spec   Spec
-		Record Record
-	}{spec, record}
-	data, err := json.Marshal(intent)
+	state, err := inspect()
 	if err != nil {
 		return Record{}, err
 	}
-	if err := session.Checkpoint(ctx, name+"-intent", data); err != nil {
-		return Record{}, err
-	}
-	pin := func(current State) error {
-		observed := record
-		observed.UniqueID = current.UniqueID
-		data, err := json.Marshal(observed)
-		if err != nil {
-			return err
+	if !state.Exists || !state.Compatible {
+		if err := session.CheckMutation(ctx); err != nil {
+			return Record{}, err
 		}
-		return session.Checkpoint(ctx, name+"-observed", data)
-	}
-	if state.Exists {
-		if err := pin(state); err != nil {
+		// Backend rechecks ownership/revision. The expected incarnation closes the
+		// read-to-write gap if the resource disappeared or was replaced meanwhile.
+		spec.ExpectedUniqueID = record.UniqueID
+		if err := s.Backend.Apply(ctx, spec, id.UID); err != nil {
+			return Record{}, err
+		}
+		state, err = inspect()
+		if err != nil {
 			return Record{}, err
 		}
 	}
-	probe := func(ctx context.Context, _ string) (recovery.Observation, error) {
-		current, err := s.Backend.Inspect(ctx, spec)
-		if err != nil {
-			return recovery.Pending, err
-		}
-		if prior != nil && (!current.Exists || current.UniqueID != prior.UniqueID) {
-			return recovery.Pending, errors.New("fabric resource identity changed")
-		}
-		if current.Exists {
-			if current.Owner != record.Owner || current.UniqueID == "" {
-				return recovery.Pending, errors.New("fabric resource ownership conflict")
-			}
-			if record.Provenance == "Adopted" && current.UniqueID != spec.AdoptUniqueID && prior == nil {
-				return recovery.Pending, errors.New("adoption identity changed")
-			}
-			if err := pin(current); err != nil {
-				return recovery.Pending, err
-			}
-			if !current.Compatible {
-				if record.Provenance == "Adopted" {
-					return recovery.Pending, errors.New("adopted configuration changed")
-				}
-				return recovery.Absent, nil // desired configuration is authoritatively absent
-			}
-			if !current.Ready {
-				return recovery.Pending, nil
-			}
-			return recovery.Applied, nil
-		}
-		if record.Provenance == "Adopted" {
-			return recovery.Pending, errors.New("adopted resource disappeared")
-		}
-		return recovery.Absent, nil
-	}
-	if err := session.Effect(ctx, name, path+":"+digest(spec), probe, func(ctx context.Context, _ string) error {
-		return s.Backend.Apply(ctx, spec, session.Identity().UID)
-	}); err != nil {
-		return Record{}, err
-	}
-	observation, err := probe(ctx, "")
-	if err != nil {
-		return Record{}, err
-	}
-	if observation != recovery.Applied {
+	if !state.Exists || !state.Compatible || !state.Ready {
 		return Record{}, recovery.ErrPending
-	}
-	state, err = s.Backend.Inspect(ctx, spec)
-	if err != nil {
-		return Record{}, err
-	}
-	if !state.Exists || !state.Ready || !state.Compatible || state.UniqueID == "" || state.Owner != record.Owner {
-		return Record{}, recovery.ErrPending
-	}
-	if err := pin(state); err != nil {
-		return Record{}, err
-	}
-	record.UniqueID = state.UniqueID
-	if prior != nil && record.UniqueID != prior.UniqueID {
-		return Record{}, errors.New("fabric resource replaced during verification")
-	}
-	data, err = json.Marshal(record)
-	if err != nil {
-		return Record{}, err
-	}
-	if err := session.Checkpoint(ctx, name+"-identity", data); err != nil {
-		return Record{}, err
 	}
 	return record, nil
 }

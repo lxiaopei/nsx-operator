@@ -312,6 +312,81 @@ spec:
                 maxLength: 32
                 minLength: 1
                 type: string
+              fabricResources:
+                description: FabricResources retains NSX identities and adoption provenance
+                  across retries.
+                items:
+                  description: |-
+                    FabricResourceStatus identifies a resource observed during fabric preparation.
+                    Records survive action changes; readiness is always checked against live NSX state.
+                  properties:
+                    consumers:
+                      description: Consumers retains transition references that use
+                        this shared resource.
+                      items:
+                        description: FabricConsumerStatus identifies a transition
+                          that consumes an NSX resource.
+                        properties:
+                          kind:
+                            description: Kind is the transition kind.
+                            maxLength: 128
+                            minLength: 1
+                            type: string
+                          name:
+                            description: Name is the transition name.
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          uid:
+                            description: UID distinguishes a recreated transition
+                              from its predecessor.
+                            maxLength: 128
+                            minLength: 1
+                            type: string
+                        required:
+                        - kind
+                        - name
+                        - uid
+                        type: object
+                      maxItems: 1000
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - uid
+                      x-kubernetes-list-type: map
+                    owner:
+                      description: Owner is the transition UID found in the NSX ownership
+                        tag, if present.
+                      maxLength: 128
+                      type: string
+                    path:
+                      description: Path is the deterministic NSX Policy path.
+                      maxLength: 1024
+                      minLength: 1
+                      type: string
+                    provenance:
+                      description: Provenance distinguishes migration-owned resources
+                        from read-only adoption.
+                      enum:
+                      - Created
+                      - Adopted
+                      type: string
+                    uniqueID:
+                      description: UniqueID detects replacement at the same path.
+                      maxLength: 128
+                      minLength: 1
+                      type: string
+                  required:
+                  - consumers
+                  - path
+                  - provenance
+                  - uniqueID
+                  type: object
+                maxItems: 1000
+                type: array
+                x-kubernetes-list-map-keys:
+                - path
+                x-kubernetes-list-type: map
               irreversibleAction:
                 description: |-
                   IrreversibleAction identifies the action whose point of no return has been persisted.

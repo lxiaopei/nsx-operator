@@ -37,7 +37,7 @@ import (
 )
 
 // TestFabricNSXIntegration is opt-in and mutates only uniquely named test resources.
-// NSX calls are real; Kubernetes objects/journals use a local fake client. It does
+// NSX calls are real; Kubernetes status and lock objects use a local fake client. It does
 // not validate API-server persistence, Net Operator, SNAT, or migration traffic.
 // Credentials are read from the Jenkins artifact file, never command-line arguments.
 func TestFabricNSXIntegration(t *testing.T) {
@@ -117,7 +117,7 @@ func TestFabricNSXIntegration(t *testing.T) {
 			require.True(t, isMissing(err), "test resource must be absent: %v", err)
 			t.Cleanup(func() { out.Cleaned = cleanupLiveFabric(t, c, spec, owner, out.UniqueID); writeReport() })
 			store, session, obj := liveSession(t, owner, nil)
-			service := &fabric.Service{Backend: backend}
+			service := &fabric.Service{Backend: backend, Status: &fabric.KubernetesResourceStatus{Client: store.Client, Reader: store.Reader}}
 			beforeWrites := backend.writes
 			record, err := waitLiveFabric(ctx, service, session, spec, 90*time.Second)
 			if err != nil {
@@ -135,21 +135,29 @@ func TestFabricNSXIntegration(t *testing.T) {
 			require.Equal(t, record.UniqueID, record2.UniqueID)
 			require.Equal(t, writes, backend.writes)
 			out.Reused = true
-			// Rebuild the local client from a JSON journal snapshot, then reacquire ownership.
+			// Rebuild from serialized CR status and lock state, then reacquire ownership.
 			var journals corev1.ConfigMapList
 			require.NoError(t, store.Client.List(ctx, &journals))
 			snapshot, err := json.Marshal(journals.Items)
 			require.NoError(t, err)
 			var restored []corev1.ConfigMap
 			require.NoError(t, json.Unmarshal(snapshot, &restored))
-			_, restarted, _ := liveSession(t, owner, restored)
+			fresh := &api.ControlPlaneNetworkTransition{}
+			require.NoError(t, store.Reader.Get(ctx, client.ObjectKeyFromObject(obj), fresh))
+			statusSnapshot, err := json.Marshal(fresh.Status)
+			require.NoError(t, err)
+			restoredStore, restarted, restoredObj := liveSession(t, owner, restored)
+			require.NoError(t, json.Unmarshal(statusSnapshot, &restoredObj.Status))
+			require.NoError(t, restoredStore.Client.Status().Update(ctx, restoredObj))
+			service.Status = &fabric.KubernetesResourceStatus{Client: restoredStore.Client, Reader: restoredStore.Reader}
 			record2, err = service.Ensure(ctx, restarted, spec)
 			require.NoError(t, err)
 			require.Equal(t, record.UniqueID, record2.UniqueID)
 			require.Equal(t, writes, backend.writes)
 			out.RestartReused = true
 			// A separate transition must explicitly adopt; adoption does not patch the object.
-			_, adopter, _ := liveSession(t, types.UID(runID+"-adopter"), nil)
+			adopterStore, adopter, _ := liveSession(t, types.UID(runID+"-adopter"), nil)
+			service.Status = &fabric.KubernetesResourceStatus{Client: adopterStore.Client, Reader: adopterStore.Reader}
 			_, err = service.Ensure(ctx, adopter, spec)
 			require.ErrorContains(t, err, "explicit adoption")
 			adoption := spec
@@ -200,7 +208,7 @@ func liveSession(t *testing.T, owner types.UID, records []corev1.ConfigMap) (*re
 	for i := range records {
 		objects = append(objects, records[i].DeepCopy())
 	}
-	k := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	k := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(obj).WithObjects(objects...).Build()
 	store := &recovery.Store{Client: k, Reader: k}
 	session, err := store.Acquire(context.Background(), recovery.Identity{UID: owner, Name: obj.Name, Kind: "ControlPlaneNetworkTransition", Action: "Evaluate", Generation: 1}, recovery.Scope{AllNamespaces: true})
 	require.NoError(t, err)

@@ -178,12 +178,22 @@ managed configuration lists request empty configuration. Omitted (nil) lists and
 optional scalar fields retain NSX defaults/current values, including TGW transit
 subnets supplied by NSX.
 
-Journals retain creation/adoption intent, payload, consumers and NSX unique IDs,
-including identities observed before realization completes. Replaced/deleted
-recorded resources block recovery instead of being recreated. Every reuse checks
-live readiness even when the effect journal already says Applied. Consumer records
-are retained per operation; cleanup must consult all journals and live consumers,
-including other transition CRs. This service does not delete shared resources.
+Fabric reconciliation uses deterministic NSX paths and ownership tags, not per-resource
+operation steps or payload snapshots. `status.fabricResources` on either transition
+CR retains NSX unique IDs, creation/adoption provenance and consumer references.
+Identities are saved before updating an existing resource and while realization is
+pending. Deleted/replaced recorded resources block recovery instead of being recreated;
+the NSX adapter checks the expected unique ID again immediately before an update.
+Every reuse checks live readiness. Status writes use uncached reads and optimistic
+concurrency; action handlers must refresh the CR before publishing subsequent status.
+Cleanup must consult all transition resource records and live consumers, including
+other transition CRs. This service does not delete shared resources.
+
+Acquiring a mutation session creates only the shared lock. Fabric preparation does
+not create a `migration-op-<hash>` ConfigMap. The framework creates an operation
+journal lazily when an action needs a journaled effect, a recovery checkpoint or a
+verified completion snapshot. Source-IPAM/SNAT recovery still uses that journal;
+removing it from those workflows is a separate change from NSX resource reconciliation.
 
 `NetOperatorSource.Reserve` uses the installed Net Operator API: `poolRef` references
 a namespaced **Network**, not an IPPool. It creates a deterministic source allocation
@@ -229,15 +239,15 @@ not a replacement for pre-cutover dataplane/traffic validation.
 
 The source-IPAM Role grants only Network reads and allocation get/create in
 `vmware-system-netop`, bound to the NCP ServiceAccount in `vmware-system-nsx`.
-The RBAC kustomization preserves each resource's explicit namespace. No new CRD
-fields or normal networking-controller behavior are introduced.
+The RBAC kustomization preserves each resource's explicit namespace. The CRDs add
+`status.fabricResources`; normal networking-controller behavior is unchanged.
 
 ### Opt-in live NSX harness
 
 `pkg/nsx/services/migration/fabric_integration_test.go` runs real NSX VPC/TGW
 create-and-realize, no-write reuse, explicit adoption and foreign-owner rejection
 checks. It reconstructs a **local fake Kubernetes client** from serialized recovery
-journals to simulate service restart. It does not test Kubernetes API-server CAS,
+CR status and lock ConfigMaps to simulate service restart. It does not test Kubernetes API-server CAS,
 a real controller restart, Net Operator allocation, DVC conversion, SNAT or traffic.
 
 Download the Jenkins `testbedInfo.json` to a private local file (mode 0600). The
@@ -338,7 +348,7 @@ Project responses; no live migration has been run for this change.
 - The current implementation serializes all Supervisor migration mutations. This
   is deliberately more conservative than independent DVS/VPC locks and prevents
   shared topology effects from overlapping. Lock contention remains retryable.
-- `migration-op-<identity hash>` journals preserve immutable named recovery
+- `migration-op-<identity hash>` journals are created on demand and preserve immutable named recovery
   checkpoints (such as original backing and resource provenance), external-effect
   intents, outcomes, verified completion, and confirmation of persisted CR status.
   Corrected Evaluate and namespace rollback retain previous journals; handlers can

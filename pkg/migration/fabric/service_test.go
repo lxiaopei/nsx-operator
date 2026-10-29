@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"github.com/vmware/vsphere-automation-sdk-go/runtime/data"
 	"github.com/vmware/vsphere-automation-sdk-go/services/nsxt/model"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -44,10 +43,27 @@ type backend struct {
 	writes                int
 	readErr, errorOnApply error
 	pending               bool
+	inspect               func(int) State
 }
 
-func (b *backend) Inspect(context.Context, Spec) (State, error) { b.reads++; return b.state, b.readErr }
-func (b *backend) Apply(_ context.Context, _ Spec, owner types.UID) error {
+func (b *backend) Inspect(context.Context, Spec) (State, error) {
+	b.reads++
+	if b.inspect != nil {
+		return b.inspect(b.reads), b.readErr
+	}
+	return b.state, b.readErr
+}
+func (b *backend) Apply(ctx context.Context, spec Spec, owner types.UID) error {
+	if spec.ExpectedUniqueID != "" {
+		state, err := b.Inspect(ctx, spec)
+		if err != nil {
+			return err
+		}
+		if !state.Exists || state.UniqueID != spec.ExpectedUniqueID {
+			return errors.New("fabric resource identity changed")
+		}
+	}
+
 	b.writes++
 	b.state = State{Exists: true, UniqueID: "resource-uid", Owner: owner, Compatible: true, Ready: !b.pending}
 	return b.errorOnApply
@@ -60,7 +76,7 @@ func TestFabricLostReplyAndRestart(t *testing.T) {
 	ctx := context.Background()
 	store, session, _ := setup(t)
 	b := &backend{errorOnApply: errors.New("lost response")}
-	s := &Service{Backend: b}
+	s := &Service{Backend: b, Status: &KubernetesResourceStatus{Client: store.Client, Reader: store.Reader}}
 	_, err := s.Ensure(ctx, session, vpcSpec())
 	require.ErrorContains(t, err, "lost response")
 	require.Equal(t, 1, b.writes)
@@ -80,14 +96,43 @@ func TestFabricLostReplyAndRestart(t *testing.T) {
 }
 
 func TestPendingFabricIdentityRetained(t *testing.T) {
-	_, session, _ := setup(t)
+	store, session, _ := setup(t)
 	b := &backend{pending: true}
-	s := &Service{Backend: b}
+	s := &Service{Backend: b, Status: &KubernetesResourceStatus{Client: store.Client, Reader: store.Reader}}
 	_, err := s.Ensure(context.Background(), session, vpcSpec())
 	require.ErrorIs(t, err, recovery.ErrPending)
 	b.state = State{} // pending resource deleted before realization
 	_, err = s.Ensure(context.Background(), session, vpcSpec())
 	require.ErrorContains(t, err, "removed or replaced")
+	require.Equal(t, 1, b.writes)
+}
+
+func TestFabricIdentityRetainedWithinCall(t *testing.T) {
+	for _, replacement := range []string{"", "replacement"} {
+		t.Run("replacement="+replacement, func(t *testing.T) {
+			store, session, _ := setup(t)
+			b := &backend{inspect: func(read int) State {
+				if read == 1 {
+					return State{Exists: true, UniqueID: "original", Owner: "infra"}
+				}
+				return State{Exists: replacement != "", UniqueID: replacement, Owner: "infra"}
+			}}
+			_, err := (&Service{Backend: b, Status: &KubernetesResourceStatus{Client: store.Client, Reader: store.Reader}}).Ensure(context.Background(), session, vpcSpec())
+			require.ErrorContains(t, err, "identity changed")
+			require.Zero(t, b.writes, "a disappeared or replaced resource must not be recreated or configured")
+		})
+	}
+}
+
+func TestFabricCheckpointStillChecksLiveReadiness(t *testing.T) {
+	store, session, _ := setup(t)
+	b := &backend{}
+	s := &Service{Backend: b, Status: &KubernetesResourceStatus{Client: store.Client, Reader: store.Reader}}
+	_, err := s.Ensure(context.Background(), session, vpcSpec())
+	require.NoError(t, err)
+	b.state.Ready = false
+	_, err = s.Ensure(context.Background(), session, vpcSpec())
+	require.ErrorIs(t, err, recovery.ErrPending)
 	require.Equal(t, 1, b.writes)
 }
 
@@ -106,9 +151,9 @@ func TestFabricAdoptionAndErrors(t *testing.T) {
 		{name: "unavailable", readErr: errors.New("unavailable"), want: "unavailable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, session, _ := setup(t)
+			store, session, _ := setup(t)
 			b := &backend{state: tc.state, readErr: tc.readErr}
-			s := &Service{Backend: b}
+			s := &Service{Backend: b, Status: &KubernetesResourceStatus{Client: store.Client, Reader: store.Reader}}
 			spec := vpcSpec()
 			spec.AdoptUniqueID = tc.adopt
 			r, err := s.Ensure(context.Background(), session, spec)
@@ -123,16 +168,18 @@ func TestFabricAdoptionAndErrors(t *testing.T) {
 	}
 }
 
-func TestFabricRejectsPayloadAndActionChanges(t *testing.T) {
+func TestFabricReconcilesPayloadAndFencesActionChanges(t *testing.T) {
 	store, session, obj := setup(t)
 	b := &backend{}
-	s := &Service{Backend: b}
+	s := &Service{Backend: b, Status: &KubernetesResourceStatus{Client: store.Client, Reader: store.Reader}}
 	spec := vpcSpec()
 	_, err := s.Ensure(context.Background(), session, spec)
 	require.NoError(t, err)
 	spec.VPC.PrivateIps = []string{"10.0.0.0/24"}
+	b.state.Compatible = false
 	_, err = s.Ensure(context.Background(), session, spec)
-	require.ErrorContains(t, err, "checkpoint")
+	require.NoError(t, err) // configuration is reconciled; identity remains pinned
+	require.NoError(t, store.Reader.Get(context.Background(), client.ObjectKeyFromObject(obj), obj))
 	obj.Spec.Action = api.ActionPlan
 	require.NoError(t, store.Client.Update(context.Background(), obj))
 	// Persisted request check prevents side effects even with an otherwise valid handle.
@@ -141,13 +188,13 @@ func TestFabricRejectsPayloadAndActionChanges(t *testing.T) {
 	b.state = State{}
 	_, err = s.Ensure(context.Background(), session, spec)
 	require.ErrorIs(t, err, recovery.ErrFenced)
-	require.Equal(t, 1, b.writes)
+	require.Equal(t, 2, b.writes)
 }
 
 func TestFabricPhaseBoundary(t *testing.T) {
-	_, session, _ := setup(t)
+	store, session, _ := setup(t)
 	b := &backend{}
-	s := &Service{Backend: b}
+	s := &Service{Backend: b, Status: &KubernetesResourceStatus{Client: store.Client, Reader: store.Reader}}
 	spec := vpcSpec()
 	spec.VPC = nil
 	spec.Kind = DVC
@@ -176,16 +223,6 @@ func TestStatusAcceptanceIsDurableAndImmutable(t *testing.T) {
 	require.ErrorContains(t, status.Accept(context.Background(), obj, r), "cannot be replaced")
 }
 
-func TestTGWSpanParticipatesInPayloadIdentity(t *testing.T) {
-	spec := vpcSpec()
-	spec.Kind = TransitGateway
-	spec.VPC = nil
-	spec.TransitGateway = &model.TransitGateway{Span: data.NewStructValue("span", map[string]data.DataValue{"transport_zone_path": data.NewStringValue("zone-a")})}
-	first := digest(spec)
-	spec.TransitGateway.Span = data.NewStructValue("span", map[string]data.DataValue{"transport_zone_path": data.NewStringValue("zone-b")})
-	require.NotEqual(t, first, digest(spec))
-}
-
 func TestDVCRequiresResolvedL2L3Configuration(t *testing.T) {
 	spec := vpcSpec()
 	spec.Kind = DVC
@@ -197,4 +234,61 @@ func TestDVCRequiresResolvedL2L3Configuration(t *testing.T) {
 	require.ErrorContains(t, spec.Validate(), "zone/span")
 	spec.DVC.RestrictedAvailability = &model.VlanAvailability{ZoneExternalIds: []string{"zone-a"}}
 	require.NoError(t, spec.Validate())
+}
+
+func TestFabricPersistsStatusWithoutOperationConfigMap(t *testing.T) {
+	ctx := context.Background()
+	store, session, obj := setup(t)
+	b := &backend{pending: true}
+	status := &KubernetesResourceStatus{Client: store.Client, Reader: store.Reader}
+	_, err := (&Service{Backend: b, Status: status}).Ensure(ctx, session, vpcSpec())
+	require.ErrorIs(t, err, recovery.ErrPending)
+	require.NoError(t, store.Reader.Get(ctx, client.ObjectKeyFromObject(obj), obj))
+	require.Len(t, obj.Status.FabricResources, 1)
+	require.Equal(t, "resource-uid", obj.Status.FabricResources[0].UniqueID)
+	require.Equal(t, "NSX_LB", string(obj.Status.TargetLBProvider), "preserve unrelated status")
+	var cms corev1.ConfigMapList
+	require.NoError(t, store.Reader.List(ctx, &cms))
+	require.Len(t, cms.Items, 1)
+	require.Equal(t, recovery.LockName, cms.Items[0].Name)
+	restarted, err := store.Acquire(ctx, session.Identity(), recovery.Scope{AllNamespaces: true})
+	require.NoError(t, err)
+	b.state.Ready = true
+	record, err := (&Service{Backend: b, Status: &KubernetesResourceStatus{Client: store.Client, Reader: store.Reader}}).Ensure(ctx, restarted, vpcSpec())
+	require.NoError(t, err)
+	require.Equal(t, "resource-uid", record.UniqueID)
+	require.Equal(t, 1, b.writes)
+	b.state = State{}
+	_, err = (&Service{Backend: b, Status: status}).Ensure(ctx, restarted, vpcSpec())
+	require.ErrorContains(t, err, "removed or replaced")
+	require.Equal(t, 1, b.writes)
+}
+
+type failingResourceStatus struct{ ResourceStatus }
+
+func (s failingResourceStatus) Save(context.Context, recovery.Identity, Record) error {
+	return errors.New("status unavailable")
+}
+
+func TestFabricStatusFailurePreventsConfiguration(t *testing.T) {
+	store, session, _ := setup(t)
+	b := &backend{state: State{Exists: true, UniqueID: "resource-uid", Owner: "infra"}}
+	s := &Service{Backend: b, Status: failingResourceStatus{&KubernetesResourceStatus{Client: store.Client, Reader: store.Reader}}}
+	_, err := s.Ensure(context.Background(), session, vpcSpec())
+	require.ErrorContains(t, err, "status unavailable")
+	require.Zero(t, b.writes)
+}
+
+func TestFabricCreateStatusFailureReusesResource(t *testing.T) {
+	store, session, _ := setup(t)
+	b := &backend{}
+	status := &KubernetesResourceStatus{Client: store.Client, Reader: store.Reader}
+	s := &Service{Backend: b, Status: failingResourceStatus{status}}
+	_, err := s.Ensure(context.Background(), session, vpcSpec())
+	require.ErrorContains(t, err, "status unavailable")
+	require.Equal(t, 1, b.writes)
+	s.Status = status
+	_, err = s.Ensure(context.Background(), session, vpcSpec())
+	require.NoError(t, err)
+	require.Equal(t, 1, b.writes)
 }

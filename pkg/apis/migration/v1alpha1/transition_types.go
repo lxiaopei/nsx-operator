@@ -3,7 +3,10 @@
 
 package v1alpha1
 
-import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+)
 
 // Action selects an explicit migration operation.
 // +kubebuilder:validation:Enum=Evaluate;Plan;Derive;Execute;Rollback;Commit;Finalize
@@ -122,6 +125,13 @@ type RequiredInput struct {
 
 // TransitionStatus persists shared progress and resumable workflow state.
 type TransitionStatus struct {
+	// FabricResources retains NSX identities and adoption provenance across retries.
+	// +optional
+	// +listType=map
+	// +listMapKey=path
+	// +kubebuilder:validation:MaxItems=1000
+	FabricResources []FabricResourceStatus `json:"fabricResources,omitempty"`
+
 	// Conditions report the current operation's readiness and failures.
 	// +optional
 	// +listType=map
@@ -181,4 +191,55 @@ type NSXWorkflowStatus struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=256
 	WorkflowID string `json:"workflowId,omitempty"`
+}
+
+// FabricResourceStatus identifies a resource observed during fabric preparation.
+// Records survive action changes; readiness is always checked against live NSX state.
+type FabricResourceStatus struct {
+	// Consumers retains transition references that use this shared resource.
+	// +required
+	// +listType=map
+	// +listMapKey=uid
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=1000
+	Consumers []FabricConsumerStatus `json:"consumers"`
+
+	// Path is the deterministic NSX Policy path.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=1024
+	Path string `json:"path"`
+	// UniqueID detects replacement at the same path.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	UniqueID string `json:"uniqueID"`
+	// Provenance distinguishes migration-owned resources from read-only adoption.
+	// +required
+	// +kubebuilder:validation:Enum=Created;Adopted
+	Provenance string `json:"provenance"`
+	// Owner is the transition UID found in the NSX ownership tag, if present.
+	// +optional
+	// +kubebuilder:validation:MaxLength=128
+	Owner string `json:"owner,omitempty"`
+}
+
+// FabricConsumerStatus identifies a transition that consumes an NSX resource.
+type FabricConsumerStatus struct {
+	// Kind is the transition kind.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	Kind string `json:"kind"`
+	// Name is the transition name.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+	// UID distinguishes a recreated transition from its predecessor.
+	// +kubebuilder:validation:Type=string
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	UID types.UID `json:"uid"`
 }

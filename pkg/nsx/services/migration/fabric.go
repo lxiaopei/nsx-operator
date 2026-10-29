@@ -216,6 +216,9 @@ func (b *FabricBackend) Apply(ctx context.Context, s fabric.Spec, owner types.UI
 		if err != nil {
 			return err
 		}
+		if s.ExpectedUniqueID != "" && state.UniqueID != s.ExpectedUniqueID {
+			return errors.New("fabric resource identity changed")
+		}
 		if state.Owner != owner {
 			return errors.New("refusing to modify fabric owned by another controller")
 		}
@@ -226,6 +229,9 @@ func (b *FabricBackend) Apply(ctx context.Context, s fabric.Spec, owner types.UI
 		value = reflect.New(reflect.TypeOf(obj)).Elem()
 		value.Set(reflect.ValueOf(obj))
 	} else {
+		if s.ExpectedUniqueID != "" {
+			return errors.New("recorded fabric resource disappeared")
+		}
 		desired := desiredFabric(s)
 		value = reflect.New(reflect.TypeOf(desired)).Elem()
 		value.FieldByName("Id").Set(reflect.ValueOf(ptr.To(s.ID)))

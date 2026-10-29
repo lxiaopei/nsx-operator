@@ -7,6 +7,7 @@ package recovery
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -200,8 +201,9 @@ func TestCorrectedEvaluateRetainsPriorJournal(t *testing.T) {
 	ctx := context.Background()
 	store, id, scope := testStore(t)
 	id.Action = "Evaluate"
-	_, err := store.Acquire(ctx, id, scope)
+	session, err := store.Acquire(ctx, id, scope)
 	require.NoError(t, err)
+	require.NoError(t, session.Checkpoint(ctx, "test", json.RawMessage(`{"value":1}`)))
 	old := id
 	id.Generation++
 	_, err = store.Acquire(ctx, id, scope)
