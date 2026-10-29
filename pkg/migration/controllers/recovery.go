@@ -111,6 +111,11 @@ func (r *Reconciler) prepareRecovery(ctx context.Context, req transition.Request
 	} else if blocked != "" {
 		return nil, errors.New(blocked)
 	}
+	if r.Infrastructure != nil && r.Stage == transition.Infrastructure {
+		if err = r.Infrastructure.Bind(ctx, req.Object.(*api.ControlPlaneNetworkTransition), session); err != nil {
+			return nil, err
+		}
+	}
 	protect := req.Action == api.ActionExecute
 	if req.Action == api.ActionRollback {
 		protect, err = r.Recovery.HadCutover(ctx, req.Object.GetUID())

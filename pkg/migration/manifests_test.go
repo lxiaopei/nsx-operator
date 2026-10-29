@@ -97,15 +97,20 @@ func TestLeaseRBACMatchesSharedNCPServiceAccount(t *testing.T) {
 		}
 	}
 	require.Equal(t, "vmware-system-nsx", leaseRole.Namespace)
-	require.Len(t, leaseRole.Rules, 2)
+	require.Len(t, leaseRole.Rules, 3)
 	for _, rule := range leaseRole.Rules {
-		require.NotContains(t, rule.Verbs, "delete", "durable recovery evidence must not be garbage-collected by this controller")
+		require.NotContains(t, rule.Verbs, "delete", "retain recovery evidence")
+		if len(rule.Resources) == 1 && rule.Resources[0] == "pods" {
+			require.Equal(t, []string{"list"}, rule.Verbs)
+			continue
+		}
 		for _, verb := range []string{"get", "create", "update"} {
 			require.Contains(t, rule.Verbs, verb)
 		}
 	}
 	require.Contains(t, leaseRole.Rules[0].Resources, "configmaps")
-	require.Contains(t, leaseRole.Rules[1].Resources, "leases")
+	require.Contains(t, leaseRole.Rules[1].Resources, "pods")
+	require.Contains(t, leaseRole.Rules[2].Resources, "leases")
 	bindings := 0
 	for _, doc := range readManifestDocuments(t, "../../build/yaml/migration/rbac/bindings.yaml") {
 		var resource struct{ Kind string }

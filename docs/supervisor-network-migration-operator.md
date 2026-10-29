@@ -6,14 +6,13 @@ NCP Pod. It owns the cluster-scoped `migration.network.vmware.com/v1alpha1` reso
 
 ## Branch scope
 
-This branch, `topic/xl018891/UBMWM-12405`, builds on
-`topic/xl018891/supervisor-network-migration-operator`. It adds action dispatch,
-persisted execution checkpoints, namespace readiness and infrastructure finalization dependency gates,
-durable mutation serialization and operation recovery,
-and irreversible commit/finalize guards for
-[UBMWM-12405](https://vmw-jira.broadcom.net/browse/UBMWM-12405).
-The base branch retains the manager, observational watches, lazy NSX connectivity,
-CRD definitions, and packaging. Concrete external migration handlers are still pending.
+This branch, `topic/xl018891/migration-infrastructure-start-wbs-1.2.1`, builds on
+`topic/xl018891/UBMWM-12405` at `51b24bfd`. It implements WBS 1.2.1 infrastructure
+start/resume prerequisites: validate the published VPC provider and NCP readiness,
+resolve a pre-existing NSX Project, and bind its identity before external work.
+It reuses the parent's action dispatcher, durable mutation lock, recovery journals,
+finalizers, and irreversible checkpoint guards. Complete Evaluate/Plan/Derive/
+Execute/Finalize action handlers remain separate work.
 
 ## Framework and services
 
@@ -33,10 +32,11 @@ leader election are started. Disabled startup loads local Kubernetes REST
 configuration without probing API-server health. Valid local REST configuration
 is still required. Enabled startup retains the API health check and loopback
 fallback. `--enable-network-migration` enables dispatch and the independent lease;
-valid actions report `ActionNotImplemented` because external handlers are not yet
-wired. This flag does not implement the vCenter FSS/HTTP authorization gate.
-Startup does not load NSX configuration or contact NSX. Future handlers can retry
-missing configuration or failed client initialization. Migration startup must not
+infrastructure requests first run start/resume checks, then report
+`ActionNotImplemented` if their external action handler is not yet wired. This flag does not implement the vCenter FSS/HTTP authorization gate.
+Startup does not load NSX configuration or contact NSX. Infrastructure prerequisite
+reconciliation lazily loads the mounted configuration and reads the selected NSX
+Project; missing configuration or client initialization failures are retryable. Migration startup must not
 rely solely on `HasVPCNamespaces()`, since a VDS Supervisor may have none.
 
 Both CRDs accept `Evaluate`, `Plan`, `Derive`, and `Execute`. Namespace batches
@@ -154,6 +154,65 @@ workstream: every namespace must be imported before confirmation/Commit, using
 an explicitly selected project or a find-or-create project named after the
 namespace. These mappings are not additional transition CR inputs. VC-only
 migration uses the same namespace transition API without VCFA onboarding.
+
+## WBS 1.2.1 infrastructure start and resume
+
+`pkg/migration/infrastructure` runs before infrastructure action dispatch and is
+rechecked under durable ownership before any registered handler is invoked.
+It reports `InfrastructurePrerequisitesReady` with the current CR generation.
+Missing prerequisites produce `EvaluationFailed` for Evaluate or `Blocked` for
+later actions, with a concrete reason and a retry. Failed reads produce an Unknown
+prerequisite condition, rather than claiming the provider/project is absent.
+Existing action, workflow, VPC and SNAT checkpoints remain intact.
+
+Provider validation reads the typed net-operator
+`WorkloadNetworkConfiguration/default` through the uncached API reader. It requires
+one VPC provider with a system configuration selecting the same project as the
+transition, plus a Ready condition for the current configuration generation. The
+active system provider must remain VDS for a new migration. An existing Execute
+or Finalize checkpoint (including an Execute journal after a failed status write)
+permits resumption when the active provider has already changed to VPC.
+
+This consumes the platform-published registration contract; it does not call the
+vCenter POST /providers endpoint or install NCP. Provider publication is the
+platform/net-operator dependency tracked under WBS 2.4/8.3. A platform that has
+installed NCP but has not yet published the VPC provider remains blocked. The
+net-operator API dependency is pinned to the same published version used by the
+network-inspection branch; no locally invented WLNC spec is used.
+
+NCP readiness requires exactly one non-deleting Pod labelled
+`nsx-operator-role=master` in `vmware-system-nsx`, with a running, ready
+`nsx-operator` container and a container identity. The normal NSX operator sets
+that role after controller registration. Migration sidecar readiness, aggregate
+Pod readiness, or the existence of VPC namespaces is insufficient. This is a
+Kubernetes readiness observation, not proof of dataplane health; live action
+handlers retain their own external health and connectivity gates.
+
+Project selection follows the design: omitted `spec.nsxProjectId` means
+`/orgs/default/projects/default`; an explicit ID means
+`/orgs/default/projects/<id>`. Paths/URLs are not accepted as IDs. The NSX adapter
+uses the shared lazy client, requires `enable_vpc_network`, and performs a Project
+GET only. Missing projects, authentication failures and transport errors never
+trigger project creation or fallback. The normal operator's `default_project`
+configuration does not override this migration API contract.
+
+Before handler effects, the runtime records an immutable `infrastructure-start`
+checkpoint containing the resolved project path, ID and NSX unique ID. Retries
+reuse that binding and all existing workflow/container/allocation identities.
+A deleted/recreated project or a change after recorded effects blocks recovery.
+Existing resource checkpoints without a durable project binding require verified
+adoption before resumption; the starter does not invent their ownership.
+A previously omitted project may still be supplied during Evaluate if only
+unused discovery records exist; this does not authorize reinterpreting prepared
+resources. Historical journals are retained. No new user-facing CRD fields are
+introduced, and these checks never mark Evaluate successful or prepare resources.
+WBS 1.2.2 and the fabric/SNAT services must complete those operations.
+
+Tests cover stale/missing provider publication, unready/standby/sidecar-only NCP,
+project lookup failures without fallback, default/custom selection, resumed VPC
+state, project replacement, recorded-effect conflicts, correction before effects,
+and binding reuse after restart. Validation uses fake Kubernetes clients and NSX
+Project responses; no live migration has been run for this change.
 
 ## WBS 1.4.9 action, locking and recovery runtime
 

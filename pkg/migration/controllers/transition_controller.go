@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	api "github.com/vmware-tanzu/nsx-operator/pkg/apis/migration/v1alpha1"
+	"github.com/vmware-tanzu/nsx-operator/pkg/migration/infrastructure"
 	"github.com/vmware-tanzu/nsx-operator/pkg/migration/recovery"
 	"github.com/vmware-tanzu/nsx-operator/pkg/migration/transition"
 )
@@ -32,6 +33,8 @@ type Reconciler struct {
 	Stage     transition.Stage
 	// Recovery is required by production registration; nil is only for isolated dispatcher tests.
 	Recovery *recovery.Store
+	// Infrastructure validates Stage 1 start/resume prerequisites.
+	Infrastructure *infrastructure.Service
 	// ConfirmProtection is supplied by admission integration. Nil fails closed.
 	ConfirmProtection func(context.Context, recovery.Lock) error
 	// ConfirmFreshnessAdmission verifies deployment of WBS 1.1.4.1 before Plan dispatch.
@@ -44,6 +47,8 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;create;update,namespace=vmware-system-nsx
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list
+// +kubebuilder:rbac:groups="",resources=pods,verbs=list,namespace=vmware-system-nsx
+// +kubebuilder:rbac:groups=netoperator.vmware.com,resources=workloadnetworkconfigurations,verbs=get
 // +kubebuilder:rbac:groups=migration.network.vmware.com,resources=controlplanenetworktransitions;namespacenetworktransitions,verbs=patch
 // +kubebuilder:rbac:groups=migration.network.vmware.com,resources=controlplanenetworktransitions/finalizers;namespacenetworktransitions/finalizers,verbs=update
 
@@ -113,7 +118,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, key ctrl.Request) (ctrl.Resu
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if r.Engine.Enabled && blocked != "" {
+	var startErr error
+	if r.Engine.Enabled && r.Infrastructure != nil && r.Stage == transition.Infrastructure {
+		// A completed action needs only durable release, not a new preflight that
+		// could strand verified completion during a later provider outage.
+		completed := status.ActionState == api.ActionStateSucceeded && status.LastAction == action && status.ActionGeneration == obj.GetGeneration()
+		if !completed {
+			startErr = r.Infrastructure.Check(ctx, obj.(*api.ControlPlaneNetworkTransition))
+		}
+	}
+	if startErr != nil {
+		condition := meta.FindStatusCondition(status.Conditions, infrastructure.ConditionReady)
+		transition.Block(status, obj.GetGeneration(), condition.Reason, condition.Message)
+		if action == api.ActionEvaluate {
+			status.Phase = "EvaluationFailed"
+		}
+		result.RequeueAfter = 30 * time.Second
+	} else if r.Engine.Enabled && blocked != "" {
 		reason := "DependencyNotReady"
 		if r.Stage == transition.Namespaces && action != api.ActionRollback {
 			reason = "InfrastructureNotReady"

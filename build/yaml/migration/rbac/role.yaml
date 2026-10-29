@@ -46,6 +46,12 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - netoperator.vmware.com
+  resources:
+  - workloadnetworkconfigurations
+  verbs:
+  - get
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -62,6 +68,12 @@ rules:
   - get
   - list
   - update
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - list
 - apiGroups:
   - coordination.k8s.io
   resources:
