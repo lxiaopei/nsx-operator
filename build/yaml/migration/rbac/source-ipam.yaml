@@ -1,0 +1,28 @@
+# Copyright © 2026 Broadcom, Inc. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: supervisor-network-migration-source-ipam
+  namespace: vmware-system-netop
+rules:
+- apiGroups: [netoperator.vmware.com]
+  resources: [networks]
+  verbs: [get]
+- apiGroups: [netoperator.vmware.com]
+  resources: [ipaddressallocations]
+  verbs: [get, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: supervisor-network-migration-source-ipam
+  namespace: vmware-system-netop
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: supervisor-network-migration-source-ipam
+subjects:
+- kind: ServiceAccount
+  name: nsx-ncp
+  namespace: vmware-system-nsx

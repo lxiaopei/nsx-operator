@@ -6,13 +6,16 @@ NCP Pod. It owns the cluster-scoped `migration.network.vmware.com/v1alpha1` reso
 
 ## Branch scope
 
-This branch, `topic/xl018891/migration-infrastructure-start-wbs-1.2.1`, builds on
-`topic/xl018891/UBMWM-12405` at `51b24bfd`. It implements WBS 1.2.1 infrastructure
-start/resume prerequisites: validate the published VPC provider and NCP readiness,
-resolve a pre-existing NSX Project, and bind its identity before external work.
-It reuses the parent's action dispatcher, durable mutation lock, recovery journals,
-finalizers, and irreversible checkpoint guards. Complete Evaluate/Plan/Derive/
-Execute/Finalize action handlers remain separate work.
+This branch, `topic/xl018891/migration-fabric-preparation-wbs-1.4.3`, builds on
+`topic/xl018891/migration-infrastructure-start-wbs-1.2.1` at `eb931da9`.
+It adds the WBS 1.4.3 fabric service, typed NSX resource adapter, typed Net Operator
+source allocation service and SNAT bootstrap coordination. It retains the parent's
+infrastructure readiness/project checks and durable action/recovery runtime.
+
+This is service implementation, not end-to-end WBS 1.4.3 completion. Complete
+Evaluate/Derive handlers, inspected topology/approved-plan synthesis, and verified
+source-IPAM/target-LB integration must supply the contracts described below before
+production registration. No new action handler is registered by this branch.
 
 ## Framework and services
 
@@ -154,6 +157,115 @@ workstream: every namespace must be imported before confirmation/Commit, using
 an explicitly selected project or a find-or-create project named after the
 namespace. These mappings are not additional transition CR inputs. VC-only
 migration uses the same namespace transition API without VCFA onboarding.
+
+## WBS 1.4.3 fabric preparation
+
+`pkg/migration/fabric.Service.Ensure` prepares one resource in dependency order
+under a `recovery.Session`. The caller supplies inspected DVS/transport-zone data
+and reviewed topology. The NSX adapter in `pkg/nsx/services/migration/fabric.go`
+uses typed Policy clients for TGWs, VPCs, infra IPBlocks, DVCs and VPC connectivity
+profiles. DVC requests require a resolved VLAN, zone/span availability and the
+SDK value `ENABLED_L2_AND_L3` (the design prose calls this L2/L3 extension).
+Evaluate container preparation allows TGWs/VPCs; DVCs, ordinary blocks
+and connectivity profiles require Derive. The dedicated SNAT sequence is separate.
+
+Creation uses stable IDs and ownership tags; existing resources require matching
+ownership or an explicit adoption unique ID and compatible configuration. Adopted
+resources are never modified. Owned configuration updates preserve unmanaged SDK
+fields and carry the observed revision into PUT. Policy errors are not absence,
+and successful submission is not readiness: realization must be observed. Explicitly empty
+managed configuration lists request empty configuration. Omitted (nil) lists and
+optional scalar fields retain NSX defaults/current values, including TGW transit
+subnets supplied by NSX.
+
+Journals retain creation/adoption intent, payload, consumers and NSX unique IDs,
+including identities observed before realization completes. Replaced/deleted
+recorded resources block recovery instead of being recreated. Every reuse checks
+live readiness even when the effect journal already says Applied. Consumer records
+are retained per operation; cleanup must consult all journals and live consumers,
+including other transition CRs. This service does not delete shared resources.
+
+`NetOperatorSource.Reserve` uses the installed Net Operator API: `poolRef` references
+a namespaced **Network**, not an IPPool. It creates a deterministic source allocation
+in `vmware-system-netop`, retains its UID in the private journal, and verifies
+ownership, Ready, exact requested IP and family. The retention finalizer
+`migration.network.vmware.com/lb-snat` and absence of a transition ownerReference
+prevent ordinary CR pruning from releasing SNAT. WBS 1.4.10 must implement ordered
+retirement before removing that finalizer. The source allocator does not delete,
+replace or mutate an unresolved request to implement fallback. Source cancellation
+and fallback protection remain required integration contracts.
+
+`SNATService.Bootstrap` checks supported capabilities and LB VPC readiness before
+reservation. It journals the accepted source identity and persists
+`status.lbSnatReservations` before target configuration. Status-write failure
+resumes from the journal without allocating again. The backend must preserve the
+source reservation and VIP exclusion, create the dedicated single-address block,
+verify an exact target allocation, and configure/verify LB SNAT. It must preserve
+the other address family. `PartitionVIPRanges` splits IPv4/IPv6 ranges around all
+accepted SNAT addresses, avoiding overlapping broad frontend blocks. This arithmetic
+alone neither updates source IPAM nor proves NSX block compatibility.
+
+`SNATService.Verify` is the read-only reuse path for Derive and Stage 2. It does not
+allocate another SNAT address or repair missing resources. Backend readiness is
+not a replacement for pre-cutover dataplane/traffic validation.
+
+### Integration gates still required
+
+- Installed Net Operator `IPAddressAllocation` exposes a Network reference and
+  optional exact IP, but no explicit family/pool selector. Source validation must
+  prove selection of the intended VIP/backend pool and family, source-IPAM
+  preservation across backend migration, and fallback cancellation/protection.
+- `CannotAllocIP` is not proof of exhaustion. Only an authoritative exhaustion
+  result may produce the family-specific `requiredInputs` entry. Transport, auth,
+  realization and generic allocation failures remain errors.
+- The installed SDK's `LBService` model has no explicit SNAT address property.
+  Existing VPC restore code uses special service-allocation identities, but that
+  alone does not establish the migration bootstrap contract for both TEP/TEPless.
+  A verified target adapter must implement singleton-block compatibility, exact
+  target allocation and LB SNAT readiness; none is invented or enabled here.
+- Source inspection and approved Plan synthesis must provide VLAN/zone identities,
+  topology dependencies, full managed configuration and consumer UIDs. VPC/TGW
+  attachments and workflow conversion remain coordinated with their owning services.
+
+The source-IPAM Role grants only Network reads and allocation get/create in
+`vmware-system-netop`, bound to the NCP ServiceAccount in `vmware-system-nsx`.
+The RBAC kustomization preserves each resource's explicit namespace. No new CRD
+fields or normal networking-controller behavior are introduced.
+
+### Opt-in live NSX harness
+
+`pkg/nsx/services/migration/fabric_integration_test.go` runs real NSX VPC/TGW
+create-and-realize, no-write reuse, explicit adoption and foreign-owner rejection
+checks. It reconstructs a **local fake Kubernetes client** from serialized recovery
+journals to simulate service restart. It does not test Kubernetes API-server CAS,
+a real controller restart, Net Operator allocation, DVC conversion, SNAT or traffic.
+
+Download the Jenkins `testbedInfo.json` to a private local file (mode 0600). The
+harness reads `nsxmanager["1"]` credentials from that file; do not put credentials
+in the command or commit the artifact. The disposable lab connection permits its
+self-signed TLS certificate. Normal unit-test runs skip this test.
+
+```sh
+NSX_FABRIC_TESTBED=/private/tmp/testbedInfo.json \
+NSX_FABRIC_ALLOW_CREATE=1 \
+NSX_FABRIC_REPORT=/private/tmp/fabric-live-report.json \
+go test ./pkg/nsx/services/migration \
+  -run '^TestFabricNSXIntegration$' -count=1 -v -timeout=8m
+```
+
+The default project is `default` (`NSX_FABRIC_PROJECT` overrides it); it must have
+an existing `default` TGW whose span can be read. Resources use a random `wbs143-`
+ID and ownership tag. Cleanup checks ownership and recorded unique identity,
+uses nonrecursive deletion, and confirms absence. Nothing is attached to the test
+VPC/TGW. The report records test paths before mutation and cleanup results. If the
+process is forcibly killed, inspect those exact paths and ownership before cleanup.
+
+The first testbed-138 run exposed a TGW defaulting bug: NSX populated omitted
+`transit_subnets`, which caused repeated updates. The adapter now preserves nil
+lists, while explicitly empty lists still request removal. A regression test covers
+that distinction. The subsequent live run passed all checks for VPC and TGW with
+one write each, and confirmed both resources absent after cleanup. This result
+validates those NSX resource operations, not full migration/SNAT readiness.
 
 ## WBS 1.2.1 infrastructure start and resume
 

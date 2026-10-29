@@ -402,6 +402,15 @@ func (s *Session) Effect(ctx context.Context, name, target string, probe func(co
 	if err = s.Check(ctx); err != nil {
 		return err
 	}
+	// A probe/apply may persist resource identities or other recovery checkpoints.
+	// Reload instead of overwriting those records with the pre-effect snapshot.
+	cm, err = s.store.read(ctx, s.identity.ID(), &j)
+	if err != nil {
+		return err
+	}
+	if j.Verified || j.Steps[name].Target != target {
+		return errors.New("operation changed during external effect")
+	}
 	j.Steps[name] = Step{Target: target, State: "Applied"}
 	return s.store.write(ctx, cm, j)
 }

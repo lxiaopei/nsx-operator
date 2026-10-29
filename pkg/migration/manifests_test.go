@@ -127,3 +127,20 @@ func TestLeaseRBACMatchesSharedNCPServiceAccount(t *testing.T) {
 	}
 	require.Equal(t, 1, bindings)
 }
+
+func TestSourceIPAMRBACIsNamespaceScoped(t *testing.T) {
+	docs := readManifestDocuments(t, "../../build/yaml/migration/rbac/source-ipam.yaml")
+	require.Len(t, docs, 2)
+	var role rbacv1.Role
+	require.NoError(t, json.Unmarshal(docs[0], &role))
+	require.Equal(t, "vmware-system-netop", role.Namespace)
+	require.Equal(t, []rbacv1.PolicyRule{
+		{APIGroups: []string{"netoperator.vmware.com"}, Resources: []string{"networks"}, Verbs: []string{"get"}},
+		{APIGroups: []string{"netoperator.vmware.com"}, Resources: []string{"ipaddressallocations"}, Verbs: []string{"get", "create"}},
+	}, role.Rules)
+	var binding rbacv1.RoleBinding
+	require.NoError(t, json.Unmarshal(docs[1], &binding))
+	require.Equal(t, role.Namespace, binding.Namespace)
+	require.Equal(t, role.Name, binding.RoleRef.Name)
+	require.Equal(t, []rbacv1.Subject{{Kind: "ServiceAccount", Name: "nsx-ncp", Namespace: "vmware-system-nsx"}}, binding.Subjects)
+}
