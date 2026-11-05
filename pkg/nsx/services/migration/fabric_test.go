@@ -34,10 +34,23 @@ type fabricSubnetClient struct {
 	update func(model.VpcSubnet) (model.VpcSubnet, error)
 }
 
+type fabricAttachmentClient struct {
+	vpcs.AttachmentsClient
+	get    func() (model.VpcAttachment, error)
+	update func(model.VpcAttachment) (model.VpcAttachment, error)
+}
+
 func (c fabricSubnetClient) Get(string, string, string, string) (model.VpcSubnet, error) {
 	return c.get()
 }
 func (c fabricSubnetClient) Update(_, _, _, _ string, v model.VpcSubnet) (model.VpcSubnet, error) {
+	return c.update(v)
+}
+
+func (c fabricAttachmentClient) Get(_, _, _, _ string) (model.VpcAttachment, error) {
+	return c.get()
+}
+func (c fabricAttachmentClient) Update(_, _, _, _ string, v model.VpcAttachment) (model.VpcAttachment, error) {
 	return c.update(v)
 }
 
@@ -88,6 +101,33 @@ func TestFabricSDKCreateUsesStableIdentity(t *testing.T) {
 		},
 	}}}}
 	require.NoError(t, b.Apply(context.Background(), fabricSpec(), "infra"))
+}
+
+func TestFabricSDKUpdatesVpcAttachmentToSelectedConnectivityProfile(t *testing.T) {
+	spec := fabric.Spec{
+		Kind: fabric.VPCAttachment, ID: "default", ProjectID: "default", VPCID: "migration-vpc",
+		VPCAttachment: &model.VpcAttachment{VpcConnectivityProfile: ptr.To("/orgs/default/projects/default/vpc-connectivity-profiles/migration-profile")},
+	}
+	actual := model.VpcAttachment{
+		Id: ptr.To("default"), Path: ptr.To(spec.Path()), UniqueId: ptr.To("attachment-uid"),
+		Revision:               ptr.To(int64(7)),
+		Tags:                   []model.Tag{{Scope: ptr.To(fabricOwnerScope), Tag: ptr.To("infra")}},
+		VpcConnectivityProfile: ptr.To("/orgs/default/projects/default/vpc-connectivity-profiles/old-profile"),
+	}
+	writes := 0
+	b := &FabricBackend{Service: &Service{client: &nsx.Client{VpcAttachmentClient: fabricAttachmentClient{
+		get: func() (model.VpcAttachment, error) { return actual, nil },
+		update: func(v model.VpcAttachment) (model.VpcAttachment, error) {
+			writes++
+			require.Equal(t, int64(7), *v.Revision)
+			require.Equal(t, spec.Path(), *v.Path)
+			require.Equal(t, "infra", *v.Tags[0].Tag)
+			require.Equal(t, *spec.VPCAttachment.VpcConnectivityProfile, *v.VpcConnectivityProfile)
+			return v, nil
+		},
+	}}}}
+	require.NoError(t, b.Apply(context.Background(), spec, "infra"))
+	require.Equal(t, 1, writes)
 }
 
 func TestFabricSDKUsesIDAsSubnetDisplayName(t *testing.T) {

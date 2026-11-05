@@ -50,6 +50,11 @@ func readFabric(c *nsx.Client, s fabric.Spec) (any, error) {
 			return nil, errors.New("NSX VPC client unavailable")
 		}
 		return c.VPCClient.Get("default", s.ProjectID, s.ID)
+	case fabric.VPCAttachment:
+		if c.VpcAttachmentClient == nil {
+			return nil, errors.New("NSX VPC attachment client unavailable")
+		}
+		return c.VpcAttachmentClient.Get("default", s.ProjectID, s.VPCID, s.ID)
 	case fabric.VPCSubnet:
 		if c.SubnetsClient == nil {
 			return nil, errors.New("NSX VPC subnet client unavailable")
@@ -88,6 +93,8 @@ func desiredFabric(s fabric.Spec, creating bool) any {
 		payload = *s.TransitGateway
 	case fabric.VPC:
 		payload = *s.VPC
+	case fabric.VPCAttachment:
+		payload = *s.VPCAttachment
 	case fabric.VPCSubnet:
 		payload = *s.VPCSubnet
 	case fabric.IPBlock:
@@ -280,6 +287,8 @@ func (b *FabricBackend) Apply(ctx context.Context, s fabric.Spec, owner types.UI
 		_, err = c.TransitGatewayClient.Update("default", s.ProjectID, s.ID, value.Interface().(model.TransitGateway))
 	case fabric.VPC:
 		_, err = c.VPCClient.Update("default", s.ProjectID, s.ID, value.Interface().(model.Vpc))
+	case fabric.VPCAttachment:
+		_, err = c.VpcAttachmentClient.Update("default", s.ProjectID, s.VPCID, s.ID, value.Interface().(model.VpcAttachment))
 	case fabric.VPCSubnet:
 		_, err = c.SubnetsClient.Update("default", s.ProjectID, s.VPCID, s.ID, value.Interface().(model.VpcSubnet))
 	case fabric.IPBlock:

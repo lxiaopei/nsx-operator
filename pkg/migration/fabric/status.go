@@ -32,29 +32,41 @@ func (s *KubernetesReservationStatus) Accept(ctx context.Context, obj *api.Contr
 	if current.UID != obj.UID || current.Generation != obj.Generation || current.Spec.Action != api.ActionEvaluate || !current.DeletionTimestamp.IsZero() {
 		return errors.New("SNAT Evaluate request changed")
 	}
-	if current.Status == nil || obj.Status == nil || current.Status.TargetLBProvider != obj.Status.TargetLBProvider || current.Status.TargetNSXProject != obj.Status.TargetNSXProject || current.Status.LoadBalancerVPCPath != obj.Status.LoadBalancerVPCPath {
+	if current.Status == nil || obj.Status == nil || current.Status.TargetLBProvider != obj.Status.TargetLBProvider || current.Status.TargetNSXProjectPath != obj.Status.TargetNSXProjectPath || current.Status.LoadBalancerVPCPath != obj.Status.LoadBalancerVPCPath {
 		return errors.New("resolved LB topology must be persisted before SNAT acceptance")
 	}
-	checkpoint := api.LBSNATReservationStatus{IPFamily: r.Family, IPAddress: r.IP, AllocationRef: api.AllocationReference{Namespace: r.Namespace, Name: r.Name}}
-	exists := false
-	for _, old := range current.Status.LBSNATReservations {
-		if old.IPFamily != r.Family {
-			continue
+	ip, err := address(r.IP)
+	if err != nil || !ip.Is4() {
+		return errors.New("Supervisor VDS LB SNAT allocation must be IPv4")
+	}
+	checkpoint := api.IPAllocationStatus{IPAddress: r.IP}
+	if r.Namespace != "" || r.Name != "" {
+		if r.Namespace == "" || r.Name == "" {
+			return errors.New("source allocation reference must include namespace and name")
 		}
-		if old != checkpoint {
+		checkpoint.AllocationRef = &api.NamespacedName{Namespace: r.Namespace, Name: r.Name}
+	}
+	if len(current.Status.LBSNATIPAllocations) > 0 {
+		old := current.Status.LBSNATIPAllocations[0]
+		if old.IPAddress != checkpoint.IPAddress || !sameAllocationRef(old.AllocationRef, checkpoint.AllocationRef) {
 			return errors.New("accepted SNAT reservation cannot be replaced")
 		}
-		exists = true
-	}
-	if !exists {
-		current.Status.LBSNATReservations = append(current.Status.LBSNATReservations, checkpoint)
+	} else {
+		current.Status.LBSNATIPAllocations = append(current.Status.LBSNATIPAllocations, checkpoint)
 		if err := s.Client.Status().Update(ctx, current); err != nil {
 			return err
 		}
 	}
-	obj.Status.LBSNATReservations = append([]api.LBSNATReservationStatus(nil), current.Status.LBSNATReservations...)
+	obj.Status.LBSNATIPAllocations = append([]api.IPAllocationStatus(nil), current.Status.LBSNATIPAllocations...)
 	// Refresh resourceVersion so the outer reconciler's status update does not conflict
 	// with this deliberately earlier acceptance checkpoint.
 	obj.ResourceVersion = current.ResourceVersion
 	return nil
+}
+
+func sameAllocationRef(a, b *api.NamespacedName) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }

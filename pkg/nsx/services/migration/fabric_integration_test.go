@@ -20,25 +20,20 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vmware/vsphere-automation-sdk-go/services/nsxt/infra"
 	"github.com/vmware/vsphere-automation-sdk-go/services/nsxt/model"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	api "github.com/vmware-tanzu/nsx-operator/pkg/apis/migration/v1alpha1"
 	"github.com/vmware-tanzu/nsx-operator/pkg/config"
 	"github.com/vmware-tanzu/nsx-operator/pkg/migration/fabric"
-	"github.com/vmware-tanzu/nsx-operator/pkg/migration/recovery"
 	"github.com/vmware-tanzu/nsx-operator/pkg/nsx"
 )
 
 // TestFabricNSXIntegration is opt-in and mutates only uniquely named test resources.
-// NSX calls are real; Kubernetes status and lock objects use a local fake client. It does
-// not validate API-server persistence, Net Operator, SNAT, or migration traffic.
+// NSX calls are real. The harness does not write Kubernetes objects or validate
+// Net Operator, SNAT, or migration traffic.
 // Credentials are read from the Jenkins artifact file, never command-line arguments.
 func TestFabricNSXIntegration(t *testing.T) {
 	path := os.Getenv("NSX_FABRIC_TESTBED")
@@ -79,7 +74,7 @@ func TestFabricNSXIntegration(t *testing.T) {
 	report := struct {
 		Manager, Project, RunID, Kubernetes string
 		Cases                               []liveFabricCase
-	}{Manager: manager.IP, Project: project, RunID: runID, Kubernetes: "local fake client; no Supervisor mutation"}
+	}{Manager: manager.IP, Project: project, RunID: runID, Kubernetes: "no writes; no Supervisor mutation"}
 	writeReport := func() {
 		reportPath := os.Getenv("NSX_FABRIC_REPORT")
 		if reportPath == "" {
@@ -115,10 +110,10 @@ func TestFabricNSXIntegration(t *testing.T) {
 			_, err := readFabric(c, spec)
 			require.True(t, isMissing(err), "test resource must be absent: %v", err)
 			t.Cleanup(func() { out.Cleaned = cleanupLiveFabric(t, c, spec, owner, out.UniqueID); writeReport() })
-			store, session, obj := liveSession(t, owner, nil)
+			obj := liveTransition(owner)
 			service := &fabric.Service{Backend: backend}
 			beforeWrites := backend.writes
-			record, err := waitLiveFabric(ctx, service, session, spec, 90*time.Second)
+			record, err := waitLiveFabric(ctx, service, api.ActionEvaluate, owner, spec, 90*time.Second)
 			if err != nil {
 				out.Error = err.Error()
 				t.Fatal(err)
@@ -129,31 +124,25 @@ func TestFabricNSXIntegration(t *testing.T) {
 			writeReport()
 			t.Logf("created and realized %s unique_id=%s", record.Path, record.UniqueID)
 			writes := backend.writes
-			record2, err := service.Ensure(ctx, session, spec)
+			record2, err := service.Ensure(ctx, api.ActionEvaluate, owner, spec)
 			require.NoError(t, err)
 			require.Equal(t, record.UniqueID, record2.UniqueID)
 			require.Equal(t, writes, backend.writes)
 			out.Reused = true
-			// Rebuild from serialized lock state, then reacquire ownership and inspect NSX.
-			var journals corev1.ConfigMapList
-			require.NoError(t, store.Client.List(ctx, &journals))
-			snapshot, err := json.Marshal(journals.Items)
-			require.NoError(t, err)
-			var restored []corev1.ConfigMap
-			require.NoError(t, json.Unmarshal(snapshot, &restored))
-			_, restarted, _ := liveSession(t, owner, restored)
-			record2, err = service.Ensure(ctx, restarted, spec)
+			// A fresh service instance resumes from the deterministic NSX resource path.
+			restarted := &fabric.Service{Backend: backend}
+			record2, err = restarted.Ensure(ctx, api.ActionEvaluate, owner, spec)
 			require.NoError(t, err)
 			require.Equal(t, record.UniqueID, record2.UniqueID)
 			require.Equal(t, writes, backend.writes)
 			out.RestartReused = true
 			// A separate transition must explicitly adopt; adoption does not patch the object.
-			_, adopter, _ := liveSession(t, types.UID(runID+"-adopter"), nil)
-			_, err = service.Ensure(ctx, adopter, spec)
+			adopter := types.UID(runID + "-adopter")
+			_, err = service.Ensure(ctx, api.ActionEvaluate, adopter, spec)
 			require.ErrorContains(t, err, "explicit adoption")
 			adoption := spec
 			adoption.AdoptUniqueID = record.UniqueID
-			adopted, err := service.Ensure(ctx, adopter, adoption)
+			adopted, err := service.Ensure(ctx, api.ActionEvaluate, adopter, adoption)
 			require.NoError(t, err)
 			require.Equal(t, "Adopted", adopted.Provenance)
 			require.Equal(t, writes, backend.writes)
@@ -189,28 +178,15 @@ func (b *countingFabric) Apply(ctx context.Context, s fabric.Spec, owner types.U
 	return b.FabricBackend.Apply(ctx, s, owner)
 }
 
-func liveSession(t *testing.T, owner types.UID, records []corev1.ConfigMap) (*recovery.Store, *recovery.Session, *api.ControlPlaneNetworkTransition) {
-	t.Helper()
-	scheme := runtime.NewScheme()
-	require.NoError(t, corev1.AddToScheme(scheme))
-	require.NoError(t, api.AddToScheme(scheme))
-	obj := &api.ControlPlaneNetworkTransition{ObjectMeta: metav1.ObjectMeta{Name: api.ControlPlaneNetworkTransitionName, UID: owner, Generation: 1}, Spec: api.ControlPlaneNetworkTransitionSpec{TransitionSpec: api.TransitionSpec{Action: api.ActionEvaluate}}}
-	objects := []client.Object{obj}
-	for i := range records {
-		objects = append(objects, records[i].DeepCopy())
-	}
-	k := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(obj).WithObjects(objects...).Build()
-	store := &recovery.Store{Client: k, Reader: k}
-	session, err := store.Acquire(context.Background(), recovery.Identity{UID: owner, Name: obj.Name, Kind: "ControlPlaneNetworkTransition", Action: "Evaluate", Generation: 1}, recovery.Scope{AllNamespaces: true})
-	require.NoError(t, err)
-	return store, session, obj
+func liveTransition(owner types.UID) *api.ControlPlaneNetworkTransition {
+	return &api.ControlPlaneNetworkTransition{ObjectMeta: metav1.ObjectMeta{Name: api.ControlPlaneNetworkTransitionName, UID: owner, Generation: 1}, Spec: api.ControlPlaneNetworkTransitionSpec{TransitionSpec: api.TransitionSpec{Action: api.ActionEvaluate}}}
 }
 
-func waitLiveFabric(ctx context.Context, s *fabric.Service, session *recovery.Session, spec fabric.Spec, timeout time.Duration) (fabric.Record, error) {
+func waitLiveFabric(ctx context.Context, s *fabric.Service, action api.Action, owner types.UID, spec fabric.Spec, timeout time.Duration) (fabric.Record, error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		record, err := s.Ensure(ctx, session, spec)
-		if err == nil || !errors.Is(err, recovery.ErrPending) {
+		record, err := s.Ensure(ctx, action, owner, spec)
+		if err == nil || !errors.Is(err, fabric.ErrPending) {
 			return record, err
 		}
 		if time.Now().After(deadline) {
