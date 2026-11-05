@@ -38,7 +38,7 @@ func (b *FabricBackend) client(ctx context.Context) (*nsx.Client, error) {
 	return b.Service.Client()
 }
 
-func readFabric(c *nsx.Client, s fabric.Spec) (any, error) {
+func readFabric(c *nsx.Client, s fabric.BackendSpec) (any, error) {
 	switch s.Kind {
 	case fabric.TransitGateway:
 		if c.TransitGatewayClient == nil {
@@ -50,6 +50,11 @@ func readFabric(c *nsx.Client, s fabric.Spec) (any, error) {
 			return nil, errors.New("NSX VPC client unavailable")
 		}
 		return c.VPCClient.Get("default", s.ProjectID, s.ID)
+	case fabric.VPCAttachment:
+		if c.VpcAttachmentClient == nil {
+			return nil, errors.New("NSX VPC attachment client unavailable")
+		}
+		return c.VpcAttachmentClient.Get("default", s.ProjectID, s.VPCID, s.ID)
 	case fabric.VPCSubnet:
 		if c.SubnetsClient == nil {
 			return nil, errors.New("NSX VPC subnet client unavailable")
@@ -81,13 +86,15 @@ func isMissing(err error) bool {
 	return errors.As(err, &value) || errors.As(err, &pointer)
 }
 
-func desiredFabric(s fabric.Spec, creating bool) any {
+func desiredFabric(s fabric.BackendSpec, creating bool) any {
 	var payload any
 	switch s.Kind {
 	case fabric.TransitGateway:
 		payload = *s.TransitGateway
 	case fabric.VPC:
 		payload = *s.VPC
+	case fabric.VPCAttachment:
+		payload = *s.VPCAttachment
 	case fabric.VPCSubnet:
 		payload = *s.VPCSubnet
 	case fabric.IPBlock:
@@ -117,7 +124,7 @@ func desiredFabric(s fabric.Spec, creating bool) any {
 
 // The SDK resource structs have common typed metadata but no shared Go interface.
 // Reflection is restricted to known structs and the explicit managed-field allowlist.
-func fabricState(s fabric.Spec, obj any) (fabric.State, error) {
+func fabricState(s fabric.BackendSpec, obj any) (fabric.State, error) {
 	v := reflect.ValueOf(obj)
 	state := fabric.State{Exists: true, Compatible: true}
 	str := func(name string) string {
@@ -173,7 +180,7 @@ func fabricState(s fabric.Spec, obj any) (fabric.State, error) {
 	return state, nil
 }
 
-func (b *FabricBackend) Inspect(ctx context.Context, s fabric.Spec) (fabric.State, error) {
+func (b *FabricBackend) Inspect(ctx context.Context, s fabric.BackendSpec) (fabric.State, error) {
 	if err := s.Validate(); err != nil {
 		return fabric.State{}, err
 	}
@@ -217,7 +224,7 @@ func (b *FabricBackend) Inspect(ctx context.Context, s fabric.Spec) (fabric.Stat
 	return state, nil
 }
 
-func (b *FabricBackend) Apply(ctx context.Context, s fabric.Spec, owner types.UID) error {
+func (b *FabricBackend) Apply(ctx context.Context, s fabric.BackendSpec, owner types.UID) error {
 	if owner == "" {
 		return errors.New("fabric owner UID is required")
 	}
@@ -280,6 +287,8 @@ func (b *FabricBackend) Apply(ctx context.Context, s fabric.Spec, owner types.UI
 		_, err = c.TransitGatewayClient.Update("default", s.ProjectID, s.ID, value.Interface().(model.TransitGateway))
 	case fabric.VPC:
 		_, err = c.VPCClient.Update("default", s.ProjectID, s.ID, value.Interface().(model.Vpc))
+	case fabric.VPCAttachment:
+		_, err = c.VpcAttachmentClient.Update("default", s.ProjectID, s.VPCID, s.ID, value.Interface().(model.VpcAttachment))
 	case fabric.VPCSubnet:
 		_, err = c.SubnetsClient.Update("default", s.ProjectID, s.VPCID, s.ID, value.Interface().(model.VpcSubnet))
 	case fabric.IPBlock:

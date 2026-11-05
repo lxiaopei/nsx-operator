@@ -34,6 +34,12 @@ type fabricSubnetClient struct {
 	update func(model.VpcSubnet) (model.VpcSubnet, error)
 }
 
+type fabricAttachmentClient struct {
+	vpcs.AttachmentsClient
+	get    func() (model.VpcAttachment, error)
+	update func(model.VpcAttachment) (model.VpcAttachment, error)
+}
+
 func (c fabricSubnetClient) Get(string, string, string, string) (model.VpcSubnet, error) {
 	return c.get()
 }
@@ -41,10 +47,17 @@ func (c fabricSubnetClient) Update(_, _, _, _ string, v model.VpcSubnet) (model.
 	return c.update(v)
 }
 
+func (c fabricAttachmentClient) Get(_, _, _, _ string) (model.VpcAttachment, error) {
+	return c.get()
+}
+func (c fabricAttachmentClient) Update(_, _, _, _ string, v model.VpcAttachment) (model.VpcAttachment, error) {
+	return c.update(v)
+}
+
 func (c fabricVPCClient) Get(string, string, string) (model.Vpc, error)         { return c.get() }
 func (c fabricVPCClient) Update(_, _, _ string, v model.Vpc) (model.Vpc, error) { return c.update(v) }
-func fabricSpec() fabric.Spec {
-	return fabric.Spec{Kind: fabric.VPC, ID: "lb", ProjectID: "default", VPC: &model.Vpc{PrivateIps: []string{"10.0.0.0/24"}}}
+func fabricSpec() fabric.BackendSpec {
+	return fabric.BackendSpec{Kind: fabric.VPC, ID: "lb", ProjectID: "default", VPC: &model.Vpc{PrivateIps: []string{"10.0.0.0/24"}}}
 }
 func currentVPC() model.Vpc {
 	return model.Vpc{Id: ptr.To("lb"), DisplayName: ptr.To("lb"), Path: ptr.To("/orgs/default/projects/default/vpcs/lb"), UniqueId: ptr.To("uid"), Revision: ptr.To(int64(5)), Tags: []model.Tag{{Scope: ptr.To(fabricOwnerScope), Tag: ptr.To("infra")}}, Description: ptr.To("preserve")}
@@ -90,8 +103,35 @@ func TestFabricSDKCreateUsesStableIdentity(t *testing.T) {
 	require.NoError(t, b.Apply(context.Background(), fabricSpec(), "infra"))
 }
 
+func TestFabricSDKUpdatesVpcAttachmentToSelectedConnectivityProfile(t *testing.T) {
+	spec := fabric.BackendSpec{
+		Kind: fabric.VPCAttachment, ID: "default", ProjectID: "default", VPCID: "migration-vpc",
+		VPCAttachment: &model.VpcAttachment{VpcConnectivityProfile: ptr.To("/orgs/default/projects/default/vpc-connectivity-profiles/migration-profile")},
+	}
+	actual := model.VpcAttachment{
+		Id: ptr.To("default"), Path: ptr.To(spec.Path()), UniqueId: ptr.To("attachment-uid"),
+		Revision:               ptr.To(int64(7)),
+		Tags:                   []model.Tag{{Scope: ptr.To(fabricOwnerScope), Tag: ptr.To("infra")}},
+		VpcConnectivityProfile: ptr.To("/orgs/default/projects/default/vpc-connectivity-profiles/old-profile"),
+	}
+	writes := 0
+	b := &FabricBackend{Service: &Service{client: &nsx.Client{VpcAttachmentClient: fabricAttachmentClient{
+		get: func() (model.VpcAttachment, error) { return actual, nil },
+		update: func(v model.VpcAttachment) (model.VpcAttachment, error) {
+			writes++
+			require.Equal(t, int64(7), *v.Revision)
+			require.Equal(t, spec.Path(), *v.Path)
+			require.Equal(t, "infra", *v.Tags[0].Tag)
+			require.Equal(t, *spec.VPCAttachment.VpcConnectivityProfile, *v.VpcConnectivityProfile)
+			return v, nil
+		},
+	}}}}
+	require.NoError(t, b.Apply(context.Background(), spec, "infra"))
+	require.Equal(t, 1, writes)
+}
+
 func TestFabricSDKUsesIDAsSubnetDisplayName(t *testing.T) {
-	spec := fabric.Spec{Kind: fabric.VPCSubnet, ID: "tenant-subnet", DisplayName: "tenant-subnet", ProjectID: "default", VPCID: "tenant-vpc", VPCSubnet: &model.VpcSubnet{AccessMode: ptr.To(model.VpcSubnet_ACCESS_MODE_PUBLIC), VlanConnection: ptr.To("/infra/distributed-vlan-connections/tenant-dvc")}}
+	spec := fabric.BackendSpec{Kind: fabric.VPCSubnet, ID: "tenant-subnet", DisplayName: "tenant-subnet", ProjectID: "default", VPCID: "tenant-vpc", VPCSubnet: &model.VpcSubnet{AccessMode: ptr.To(model.VpcSubnet_ACCESS_MODE_PUBLIC), VlanConnection: ptr.To("/infra/distributed-vlan-connections/tenant-dvc")}}
 	actual := model.VpcSubnet{Id: ptr.To(spec.ID), DisplayName: ptr.To(spec.ID), Path: ptr.To(spec.Path()), UniqueId: ptr.To("subnet-uid"), Revision: ptr.To(int64(3)), AccessMode: ptr.To(model.VpcSubnet_ACCESS_MODE_PUBLIC), VlanConnection: ptr.To("/infra/distributed-vlan-connections/tenant-dvc"), Tags: []model.Tag{{Scope: ptr.To(fabricOwnerScope), Tag: ptr.To("infra")}}}
 	writes := 0
 	b := &FabricBackend{Service: &Service{client: &nsx.Client{SubnetsClient: fabricSubnetClient{
@@ -152,7 +192,7 @@ func TestFabricSDKDefaultsAndSetOrdering(t *testing.T) {
 }
 
 func TestFabricSDKPreservesDefaultTransitSubnets(t *testing.T) {
-	spec := fabric.Spec{Kind: fabric.TransitGateway, ID: "tgw", ProjectID: "default", TransitGateway: &model.TransitGateway{ExternalIpSignalingMode: ptr.To("NONE")}}
+	spec := fabric.BackendSpec{Kind: fabric.TransitGateway, ID: "tgw", ProjectID: "default", TransitGateway: &model.TransitGateway{ExternalIpSignalingMode: ptr.To("NONE")}}
 	actual := model.TransitGateway{Id: ptr.To(spec.ID), Path: ptr.To(spec.Path()), UniqueId: ptr.To("tgw-uid"), ExternalIpSignalingMode: ptr.To("NONE"), TransitSubnets: []string{"100.64.0.0/21"}}
 	state, err := fabricState(spec, actual)
 	require.NoError(t, err)

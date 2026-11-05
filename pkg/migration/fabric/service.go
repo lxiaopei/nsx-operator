@@ -1,15 +1,12 @@
 /* Copyright © 2026 Broadcom, Inc. All Rights Reserved.
    SPDX-License-Identifier: Apache-2.0 */
 
-// Package fabric prepares migration topology under durable mutation ownership.
+// Package fabric prepares migration topology from the transition action and live NSX state.
 // It is a shared service, not a complete Evaluate or Derive action handler.
 package fabric
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -18,38 +15,38 @@ import (
 	"github.com/vmware/vsphere-automation-sdk-go/services/nsxt/model"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/vmware-tanzu/nsx-operator/pkg/migration/recovery"
+	api "github.com/vmware-tanzu/nsx-operator/pkg/apis/migration/v1alpha1"
 )
+
+var ErrPending = errors.New("fabric resource is not ready")
 
 type Kind string
 
 const (
 	TransitGateway      Kind = "TransitGateway"
 	VPC                 Kind = "VPC"
+	VPCAttachment       Kind = "VPCAttachment"
 	VPCSubnet           Kind = "VPCSubnet"
 	IPBlock             Kind = "IPBlock"
 	DVC                 Kind = "DVC"
 	ConnectivityProfile Kind = "ConnectivityProfile"
 )
 
-// Spec is an internal, reviewed resource request, not a CRD. Exactly one payload
-// must be set. Payload identity, tags and server metadata are supplied by Backend.
-// DVS/transport-zone discovery and approved plan synthesis belong to callers.
-type Spec struct {
-	Kind                Kind
-	ID                  string
-	DisplayName         string
-	ProjectID           string
-	VPCID               string
-	// CreateIfAbsent is set only after inspection searched the applicable shared
-	// topology (span for TGW/VPC, VDN+VLAN for DVC/subnet) and found no reusable
-	// candidate. Ensure never creates a new identity based on deterministic-path
-	// absence alone.
-	CreateIfAbsent      bool
-	AdoptUniqueID       string
+// BackendSpec is the low-level adapter request. Transition handlers use the
+// resource-specific request types in requests.go instead.
+type BackendSpec struct {
+	Kind        Kind
+	ID          string
+	DisplayName string
+	ProjectID   string
+	VPCID       string
+	// ExpectedUniqueID pins a previously inspected resource. It is required to
+	// reuse a resource owned by another transition and prevents replacement if
+	// the selected resource disappears or its identity changes.
 	ExpectedUniqueID    string
 	TransitGateway      *model.TransitGateway
 	VPC                 *model.Vpc
+	VPCAttachment       *model.VpcAttachment
 	VPCSubnet           *model.VpcSubnet
 	IPBlock             *model.IpAddressBlock
 	DVC                 *model.DistributedVlanConnection
@@ -70,8 +67,8 @@ type State struct {
 // writing, preserve unmanaged fields, and never treat a transport error as absence.
 // Apply creates or configures only resources owned by owner. Adoption is read-only.
 type Backend interface {
-	Inspect(context.Context, Spec) (State, error)
-	Apply(context.Context, Spec, types.UID) error
+	Inspect(context.Context, BackendSpec) (State, error)
+	Apply(context.Context, BackendSpec, types.UID) error
 }
 
 type Service struct {
@@ -87,7 +84,7 @@ type Record struct {
 	Owner      types.UID
 }
 
-func (s Spec) Path() string {
+func (s BackendSpec) Path() string {
 	switch s.Kind {
 	case IPBlock:
 		return "/infra/ip-blocks/" + s.ID
@@ -97,6 +94,8 @@ func (s Spec) Path() string {
 		return "/orgs/default/projects/" + s.ProjectID + "/transit-gateways/" + s.ID
 	case VPC:
 		return "/orgs/default/projects/" + s.ProjectID + "/vpcs/" + s.ID
+	case VPCAttachment:
+		return "/orgs/default/projects/" + s.ProjectID + "/vpcs/" + s.VPCID + "/attachments/" + s.ID
 	case VPCSubnet:
 		return "/orgs/default/projects/" + s.ProjectID + "/vpcs/" + s.VPCID + "/subnets/" + s.ID
 	case ConnectivityProfile:
@@ -106,112 +105,168 @@ func (s Spec) Path() string {
 	}
 }
 
-func digest(v any) string {
-	data, _ := json.Marshal(v)
-	h := sha256.Sum256(data)
-	return hex.EncodeToString(h[:16])
+// EnsureEvaluate prepares shared connectivity resources during Evaluate. Use it
+// for TGWs, VPCs, attachments, connectivity profiles and IP blocks. Resolve
+// reusable shared topology before calling; a missing resource path alone does
+// not establish that creating a new shared resource is safe.
+func (s *Service) EnsureEvaluate(ctx context.Context, owner types.UID, request EvaluateRequest) (Record, error) {
+	if isNilRequest(request) {
+		return Record{}, errors.New("Evaluate fabric request is required")
+	}
+	spec, err := request.evaluateSpec()
+	if err != nil {
+		return Record{}, err
+	}
+	return s.ensure(ctx, api.ActionEvaluate, owner, spec)
 }
 
-// Ensure reconciles one deterministic NSX path from live NSX state. It does not
-// persist a generic resource inventory in the transition CR or operation journal.
-func (s *Service) Ensure(ctx context.Context, session *recovery.Session, spec Spec) (Record, error) {
-	if session == nil || s.Backend == nil {
-		return Record{}, errors.New("fabric preparation requires a recovery session and backend")
+// EnsureDerive prepares resources derived from converted networks during Derive.
+// Use it for VLAN-extension subnets, DVCs and any IP blocks created in this phase.
+// Resolve existing resources for the same VDN/DVPG/VLAN before requesting creation.
+func (s *Service) EnsureDerive(ctx context.Context, owner types.UID, request DeriveRequest) (Record, error) {
+	if isNilRequest(request) {
+		return Record{}, errors.New("Derive fabric request is required")
+	}
+	spec, err := request.deriveSpec()
+	if err != nil {
+		return Record{}, err
+	}
+	return s.ensure(ctx, api.ActionDerive, owner, spec)
+}
+
+func isNilRequest(request any) bool {
+	if request == nil {
+		return true
+	}
+	value := reflect.ValueOf(request)
+	return value.Kind() == reflect.Pointer && value.IsNil()
+}
+
+// ensure reconciles one deterministic NSX path from live NSX state.
+func (s *Service) ensure(ctx context.Context, action api.Action, owner types.UID, spec BackendSpec) (Record, error) {
+	if owner == "" || s.Backend == nil {
+		return Record{}, errors.New("fabric owner and backend are required")
 	}
 	if err := spec.Validate(); err != nil {
 		return Record{}, err
 	}
-	id := session.Identity()
-	if id.Action != "Evaluate" && id.Action != "Derive" {
+	if action != api.ActionEvaluate && action != api.ActionDerive {
 		return Record{}, errors.New("fabric preparation is only permitted during Evaluate or Derive")
 	}
-	if id.Action == "Evaluate" && spec.Kind != TransitGateway && spec.Kind != VPC {
-		return Record{}, errors.New("Evaluate container preparation cannot realize DVCs, subnets, blocks or connectivity profiles; use the dedicated SNAT bootstrap")
+	if !allowedForAction(action, spec.Kind) {
+		return Record{}, fmt.Errorf("%s cannot prepare %s resources", action, spec.Kind)
 	}
-	if err := session.CheckMutation(ctx); err != nil {
+	state, err := s.Backend.Inspect(ctx, spec)
+	if err != nil {
+		return Record{}, err
+	}
+	if !state.Exists {
+		return s.create(ctx, owner, spec)
+	}
+	if state.UniqueID == "" {
+		return Record{}, errors.New("fabric resource has no unique identity")
+	}
+	if spec.ExpectedUniqueID != "" && spec.ExpectedUniqueID != state.UniqueID {
+		return Record{}, errors.New("candidate fabric identity changed")
+	}
+	if state.Owner != owner {
+		return reuseExisting(spec, state)
+	}
+	return s.updateOwned(ctx, owner, spec, state)
+}
+
+func (s *Service) create(ctx context.Context, owner types.UID, spec BackendSpec) (Record, error) {
+	if spec.ExpectedUniqueID != "" {
+		return Record{}, errors.New("requested fabric candidate no longer exists")
+	}
+	if err := s.Backend.Apply(ctx, spec, owner); err != nil {
 		return Record{}, err
 	}
 	state, err := s.Backend.Inspect(ctx, spec)
 	if err != nil {
 		return Record{}, err
 	}
-	if state.Exists {
-		if state.UniqueID == "" {
-			return Record{}, errors.New("fabric resource has no unique identity")
-		}
-		if spec.ExpectedUniqueID != "" && spec.ExpectedUniqueID != state.UniqueID {
-			return Record{}, errors.New("candidate fabric identity changed")
-		}
-		if state.Owner == id.UID {
-			record := Record{Path: spec.Path(), UniqueID: state.UniqueID, Provenance: "Created", Owner: state.Owner}
-			if !state.Compatible {
-				if err := session.CheckMutation(ctx); err != nil {
-					return Record{}, err
-				}
-				spec.ExpectedUniqueID = state.UniqueID
-				if err := s.Backend.Apply(ctx, spec, id.UID); err != nil {
-					return Record{}, err
-				}
-				state, err = s.Backend.Inspect(ctx, spec)
-				if err != nil {
-					return Record{}, err
-				}
-			}
-			if !state.Exists || state.UniqueID != record.UniqueID || state.Owner != id.UID || !state.Compatible {
-				return Record{}, errors.New("fabric resource identity, ownership or configuration changed during reconciliation")
-			}
-			if !state.Ready {
-				return Record{}, recovery.ErrPending
-			}
-			return record, nil
-		}
-		if spec.AdoptUniqueID == "" || spec.AdoptUniqueID != state.UniqueID {
-			return Record{}, fmt.Errorf("explicit live adoption identity required for %s", spec.Path())
-		}
-		if !state.Compatible {
-			return Record{}, errors.New("adopted fabric configuration is incompatible; it will not be modified")
-		}
-		if !state.Ready {
-			return Record{}, recovery.ErrPending
-		}
-		return Record{Path: spec.Path(), UniqueID: state.UniqueID, Provenance: "Adopted", Owner: state.Owner}, nil
+	if !state.Exists {
+		return Record{}, ErrPending
 	}
-	if spec.AdoptUniqueID != "" || spec.ExpectedUniqueID != "" {
-		return Record{}, errors.New("requested fabric candidate no longer exists")
+	if state.UniqueID == "" {
+		return Record{}, errors.New("created fabric resource has no unique identity")
 	}
-	if !spec.CreateIfAbsent {
-		return Record{}, errors.New("fabric creation requires completed shared-topology candidate inspection")
+	if state.Owner != owner {
+		return Record{}, errors.New("created fabric resource is not owned by this transition")
 	}
-	if !state.Exists || !state.Compatible {
-		if err := session.CheckMutation(ctx); err != nil {
+	if !state.Compatible {
+		return Record{}, errors.New("created fabric resource does not match the requested configuration")
+	}
+	if !state.Ready {
+		return Record{}, ErrPending
+	}
+	return Record{Path: spec.Path(), UniqueID: state.UniqueID, Provenance: "Created", Owner: state.Owner}, nil
+}
+
+func (s *Service) updateOwned(ctx context.Context, owner types.UID, spec BackendSpec, state State) (Record, error) {
+	record := Record{Path: spec.Path(), UniqueID: state.UniqueID, Provenance: "Created", Owner: owner}
+	if !state.Compatible {
+		spec.ExpectedUniqueID = state.UniqueID
+		if err := s.Backend.Apply(ctx, spec, owner); err != nil {
 			return Record{}, err
 		}
-		if err := s.Backend.Apply(ctx, spec, id.UID); err != nil {
-			return Record{}, err
-		}
+		var err error
 		state, err = s.Backend.Inspect(ctx, spec)
 		if err != nil {
 			return Record{}, err
 		}
 	}
-	if !state.Exists || state.Owner != id.UID || !state.Compatible || !state.Ready {
-		return Record{}, recovery.ErrPending
+	if !state.Exists || state.UniqueID != record.UniqueID || state.Owner != owner || !state.Compatible {
+		return Record{}, errors.New("fabric resource identity, ownership or configuration changed during reconciliation")
 	}
-	return Record{Path: spec.Path(), UniqueID: state.UniqueID, Provenance: "Created", Owner: state.Owner}, nil
+	if !state.Ready {
+		return Record{}, ErrPending
+	}
+	return record, nil
+}
+
+func reuseExisting(spec BackendSpec, state State) (Record, error) {
+	if spec.ExpectedUniqueID == "" {
+		return Record{}, fmt.Errorf("explicit live adoption identity required for %s", spec.Path())
+	}
+	if !state.Compatible {
+		return Record{}, errors.New("adopted fabric configuration is incompatible; it will not be modified")
+	}
+	if !state.Ready {
+		return Record{}, ErrPending
+	}
+	return Record{Path: spec.Path(), UniqueID: state.UniqueID, Provenance: "Adopted", Owner: state.Owner}, nil
+}
+
+// allowedForAction keeps shared connectivity preparation in Evaluate and
+// conversion resources in Derive.
+func allowedForAction(action api.Action, kind Kind) bool {
+	if action == api.ActionEvaluate {
+		return evaluatePrerequisite(kind)
+	}
+	if action == api.ActionDerive {
+		return kind == IPBlock || kind == VPCSubnet || kind == DVC
+	}
+	return false
+}
+
+func evaluatePrerequisite(kind Kind) bool {
+	return kind == TransitGateway || kind == IPBlock || kind == ConnectivityProfile || kind == VPC || kind == VPCAttachment
 }
 
 // Validate rejects malformed requests before the first effect, including read-only
 // SDK metadata. Nil managed fields retain NSX defaults; explicitly empty lists
 // request empty configuration.
-func (s Spec) Validate() error {
+func (s BackendSpec) Validate() error {
 	if !validID(s.ID) || (s.Kind != IPBlock && s.Kind != DVC && !validID(s.ProjectID)) {
 		return errors.New("fabric identity is required")
 	}
-	if s.Kind == VPCSubnet && !validID(s.VPCID) {
-		return errors.New("VPC subnet requires a valid VPC ID")
+	if (s.Kind == VPCSubnet || s.Kind == VPCAttachment) && !validID(s.VPCID) {
+		return errors.New("VPC child resource requires a valid VPC ID")
 	}
-	payloads := []any{s.TransitGateway, s.VPC, s.VPCSubnet, s.IPBlock, s.DVC, s.ConnectivityProfile}
-	kinds := []Kind{TransitGateway, VPC, VPCSubnet, IPBlock, DVC, ConnectivityProfile}
+	payloads := []any{s.TransitGateway, s.VPC, s.VPCAttachment, s.VPCSubnet, s.IPBlock, s.DVC, s.ConnectivityProfile}
+	kinds := []Kind{TransitGateway, VPC, VPCAttachment, VPCSubnet, IPBlock, DVC, ConnectivityProfile}
 	count := 0
 	for i, p := range payloads {
 		v := reflect.ValueOf(p)
@@ -227,7 +282,7 @@ func (s Spec) Validate() error {
 			field := v.Type().Field(j).Name
 			if field == "DisplayName" {
 				if !v.Field(j).IsNil() {
-					return errors.New("set the requested fabric display name through Spec.DisplayName")
+					return errors.New("set the requested fabric display name through BackendSpec.DisplayName")
 				}
 				continue
 			}
@@ -238,6 +293,18 @@ func (s Spec) Validate() error {
 	}
 	if s.DisplayName != "" && s.DisplayName != s.ID {
 		return errors.New("fabric display name must match its ID")
+	}
+	if s.ConnectivityProfile != nil {
+		tgwPrefix := "/orgs/default/projects/" + s.ProjectID + "/transit-gateways/"
+		if s.ConnectivityProfile.TransitGatewayPath == nil || !resourcePathHasID(tgwPrefix, *s.ConnectivityProfile.TransitGatewayPath) {
+			return errors.New("VPC connectivity profile requires a TGW path in the same project")
+		}
+	}
+	if s.VPCAttachment != nil {
+		profilePrefix := "/orgs/default/projects/" + s.ProjectID + "/vpc-connectivity-profiles/"
+		if s.VPCAttachment.VpcConnectivityProfile == nil || !resourcePathHasID(profilePrefix, *s.VPCAttachment.VpcConnectivityProfile) {
+			return errors.New("VPC attachment requires a connectivity profile path in the same project")
+		}
 	}
 	if count != 1 {
 		return errors.New("exactly one fabric payload is required")
@@ -253,7 +320,7 @@ func (s Spec) Validate() error {
 		}
 	}
 	if s.VPCSubnet != nil {
-		if s.VPCSubnet.VlanConnection == nil || !strings.HasPrefix(*s.VPCSubnet.VlanConnection, "/infra/distributed-vlan-connections/") {
+		if s.VPCSubnet.VlanConnection == nil || !resourcePathHasID("/infra/distributed-vlan-connections/", *s.VPCSubnet.VlanConnection) {
 			return errors.New("VPC subnet requires a valid DVC VLAN connection path")
 		}
 		if s.VPCSubnet.AccessMode == nil || *s.VPCSubnet.AccessMode != model.VpcSubnet_ACCESS_MODE_PUBLIC {
@@ -278,12 +345,21 @@ func validID(id string) bool {
 	return id != "." && id != ".."
 }
 
+func resourcePathHasID(prefix, path string) bool {
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	id := strings.TrimPrefix(path, prefix)
+	return validID(id) && !strings.Contains(id, "/")
+}
+
 // ManagedField is the explicit set that the SDK adapter compares and configures.
 // All other fields, including revision and external-controller metadata, survive updates.
 func ManagedField(kind Kind, field string) bool {
 	fields := map[Kind][]string{
 		TransitGateway:      {"DisplayName", "Span", "ExternalIpSignalingMode", "TransitSubnets"},
 		VPC:                 {"DisplayName", "ExternalIpv4Blocks", "IpAddressType", "PrivateIps", "Ipv6ProfilePaths", "LoadBalancerVpcEndpoint", "VpcServiceProfile", "TransitGatewayPath"},
+		VPCAttachment:       {"DisplayName", "VpcConnectivityProfile", "PreferredDefaultSnatIp"},
 		VPCSubnet:           {"DisplayName", "AccessMode", "IpAddressType", "IpAddresses", "IpBlocks", "Ipv4SubnetSize", "Ipv6PrefixLength", "VlanConnection"},
 		IPBlock:             {"DisplayName", "Cidrs", "Ranges", "ExcludedIps", "IpAddressType", "Visibility"},
 		DVC:                 {"DisplayName", "AssociatedIpBlockPaths", "GatewayAddresses", "RestrictedAvailability", "SubnetExtensionConnection", "VlanId"},

@@ -51,8 +51,11 @@ type ControlPlaneNetworkConfiguration struct {
 	// service when the IPv4 VIP pool cannot provide a reservation during Evaluate.
 	// Supervisor VDS source networks are IPv4-only in this release. Keep this as a
 	// slice so a later release can add IPv6 without changing the field shape.
-	// The migration service validates availability and reserves the supplied address
-	// before use. After status.lbSnatIPAllocations records an accepted allocation,
+	// If an eligible source Network is available, the migration service attempts to
+	// reserve this exact address. If none can be identified, the input is treated as
+	// administrator-asserted and no source allocation reference is recorded; the
+	// administrator is responsible for address availability and reachability.
+	// After status.lbSnatIPAllocations records an accepted address,
 	// this list cannot be added, changed, or removed, including during Evaluate.
 	// Requesting Plan prevents changes to the entire NetworkConfiguration.
 	// +optional
@@ -88,8 +91,8 @@ type ControlPlaneResourceNaming struct {
 	LoadBalancerVPCName NSXResourceName `json:"loadBalancerVpcName,omitempty"`
 }
 
-// IPAllocationStatus records an accepted LB SNAT IP allocation checkpoint.
-// The controller verifies ownership and readiness before persisting it.
+// IPAllocationStatus records an accepted LB SNAT address and, when available,
+// its source IPAM allocation reference.
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="accepted LB SNAT allocation identity is immutable"
 // +kubebuilder:validation:XValidation:rule="isIP(self.ipAddress)",message="allocated address must be a plain IP address"
 type IPAllocationStatus struct {
@@ -109,11 +112,13 @@ type IPAllocationStatus struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.irreversibleAction) || self.irreversibleAction == 'Finalize'",message="infrastructure irreversibleAction must be Finalize"
 type ControlPlaneNetworkTransitionStatus struct {
 	TransitionStatus `json:",inline"`
-	// LBSNATIPAllocations records the accepted IPv4 LB SNAT address. Once recorded,
+	// LBSNATIPAllocations records the accepted IPv4 LB SNAT address and optional
+	// source allocation reference. Once recorded,
 	// spec.networkConfiguration.lbSnatIPs cannot be added, changed, or removed,
 	// even during Evaluate. spec.targetLbProvider and spec.nsxProjectId must also
 	// remain unchanged. The accepted allocation cannot be changed or removed;
-	// recording it does not itself allocate or release an address.
+	// recording it does not itself allocate or release an address. An administrator-
+	// asserted address can be recorded without a source IPAM allocation reference.
 	// +optional
 	// +listType=map
 	// +listMapKey=ipAddress
