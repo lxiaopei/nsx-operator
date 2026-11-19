@@ -6,14 +6,12 @@ NCP Pod. It owns the cluster-scoped `migration.network.vmware.com/v1alpha1` reso
 
 ## Branch scope
 
-This branch, `topic/xl018891/UBMWM-12405`, builds on
-`topic/xl018891/supervisor-network-migration-operator`. It adds action dispatch,
-persisted execution checkpoints, namespace readiness and infrastructure finalization dependency gates,
-action dispatch with separately enforced admission and resource-driven restart reconciliation,
-and irreversible commit/finalize guards for
-[UBMWM-12405](https://vmw-jira.broadcom.net/browse/UBMWM-12405).
-The base branch retains the manager, observational watches, lazy NSX connectivity,
-CRD definitions, and packaging. Concrete external migration handlers are still pending.
+This branch, `topic/xl018891/migration-infrastructure-evaluate-wbs-1.2.2`,
+adds the Stage 1 Evaluate handler and a Net Operator source SNAT reservation
+adapter on top of the infrastructure start checks and network inspection service.
+It also adds a WCP Supervisor networks reader that maps configured DVPG backings
+to Net Operator VDNs. The running manager still needs authenticated vCenter/NSX
+client construction and handler registration before it can run Evaluate.
 
 ## Framework and services
 
@@ -33,8 +31,8 @@ leader election are started. Disabled startup loads local Kubernetes REST
 configuration without probing API-server health. Valid local REST configuration
 is still required. Enabled startup retains the API health check and loopback
 fallback. `--enable-network-migration` enables dispatch and the independent lease;
-valid actions report `ActionNotImplemented` because external handlers are not yet
-wired. This flag does not implement the vCenter FSS/HTTP authorization gate.
+valid actions still report `ActionNotImplemented` until a concrete handler is
+registered with its live dependencies. This flag does not implement the vCenter FSS/HTTP authorization gate.
 Startup does not load NSX configuration or contact NSX. Future handlers can retry
 missing configuration or failed client initialization. Migration startup must not
 rely solely on `HasVPCNamespaces()`, since a VDS Supervisor may have none.
@@ -394,8 +392,8 @@ service from WBS version 66 and detailed design version 158:
   checkpoints are preserved. Success records only this inspection milestone,
   leaving the phase `Evaluating` until the other Evaluate work completes.
 
-The control-plane handler must pass the authoritative CPVM/Supervisor Service
-VDN set obtained from WCP configuration; administrator inputs never determine
+The control-plane scope reads the WCP Supervisor networks API and maps its
+DVPG backings to Net Operator VDNs; administrator inputs never determine
 inspection scope. Namespace discovery uses the selected namespaces' source
 Network resources. Re-run discovery after a status conflict and before later
 mutation; returned topology is an observation, not a lock or reservation.
@@ -403,10 +401,11 @@ Cross-batch ownership, NSX fabric validation, and final reservation/consumer
 rechecks belong to the respective orchestration and coordination services.
 This package does not create a separate resolved-subnet status inventory.
 
-The framework controllers still only observe CRs. Wiring these service methods
-into Evaluate and supplying the WCP scope/vCenter session belongs to the stage
-handlers. RBAC includes source inventory reads and transition status patches,
-but no source-network writes. Tests cover the live govmomi simulator, Kubernetes
+The framework controllers still only observe CRs. This branch provides the
+WCP scope reader and Evaluate handler, but the manager does not construct the
+authenticated vCenter/NSX clients or register the handler yet. RBAC includes
+source inventory reads and transition status patches, but no source-network
+writes. Tests cover the live govmomi simulator, Kubernetes
 inventory reads, validation failures, both CR status writers, stale snapshots,
 missing-input recovery, and preservation of unrelated status.
 
@@ -555,6 +554,64 @@ workstream: every Namespace must be imported before confirmation/Commit, using
 an explicitly selected project or a find-or-create project named after the
 Namespace. These mappings are not additional transition CR inputs. VC-only
 migration uses the same Namespace transition API without VCFA onboarding.
+
+## WBS 1.2.1 infrastructure start and resume checks
+
+Before infrastructure actions run, `pkg/migration/infrastructure` verifies the
+platform-published VPC provider and readiness of the normal `nsx-operator`
+container in `vmware-system-nsx`. It resolves the explicit `spec.nsxProjectID`, or
+the `default` Project when omitted, using a read-only NSX GET. It does not register
+providers, create Projects, create migration resources, or mark Evaluate complete.
+
+The chosen Project path is recorded in the existing `status.targetNSXProjectPath`
+field. On each retry, the service rechecks readiness and the same project identity;
+existing status fields are preserved if those checks fail. VPC may be the active
+provider only when an Execute or Finalize checkpoint already exists. Once an action
+has started or infrastructure resources are recorded, changing the selected
+Project is rejected. Existing CR status and observed Kubernetes/NSX resources are
+the recovery source; no journal or additional checkpoint object is introduced.
+
+The provider check reads the typed
+`WorkloadNetworkConfiguration/default` and requires one ready VPC provider whose
+configured project matches the transition. NCP readiness requires exactly one
+active Pod labelled `nsx-operator-role=master` with a running, ready
+`nsx-operator` container. Migration-sidecar readiness or the presence of VPC
+namespaces alone is insufficient. Failures are surfaced through the
+`InfrastructurePrerequisitesReady` condition and block dispatch for retry.
+
+The check consumes provider registration published by the platform/net-operator;
+it does not call the vCenter provider registration endpoint or install NCP. Unit
+tests use fake Kubernetes and NSX responses and cover readiness gating, project
+selection, correction before action start, project immutability after the action
+checkpoint, and status preservation on lookup failures. These checks do not
+themselves perform a live infrastructure migration.
+
+## WBS 1.2.2 infrastructure Evaluate
+
+`EvaluateHandler` uses an authoritative CPVM/Supervisor Service VDN set, runs
+shared source inspection, and writes DHCP diagnostics and an `EvaluationPreview`
+condition in transition status. Missing DHCP inputs return `NeedsInput`; incompatible
+source data fails Evaluate. The preview lists discovered VDNs, their addressing,
+and whether target TGW/VPC preparation will be needed during Execute. Evaluate
+does not create target NSX resources.
+
+The handler uses `NetOperatorSNAT` to reserve one source address through a
+namespaced Net Operator `IPAddressAllocation`. A deterministic allocation name
+and transition UID label make retries find the same request. It waits for Ready
+before recording `status.lbSNATIPAllocations`; later retries verify that the
+recorded allocation still owns the same IP and Network. VIP fallback tries
+addresses in the advertised VIP ranges in order when Net Operator reports an
+address unavailable. An administrator-supplied backend IP uses a source
+allocation when a managed Network can be identified; otherwise it is recorded
+as administrator-managed, without `allocationRef`.
+
+The source Network resolver matches either a vCenter DVPG ID or VDN name to a
+Net Operator Network in the configured Namespace. The WCP scope resolves
+Supervisor network IDs to DVPG IDs before mapping them to VDNs. The production
+manager still needs authenticated vCenter/NSX client construction and handler
+registration. Cleanup of a source allocation after a
+changed or deleted evaluation request is also pending; these gaps must be closed
+before WBS 1.2.2 is complete end to end.
 
 ## WBS 1.4.9 action dispatch and restart reconciliation
 
